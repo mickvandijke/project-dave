@@ -16,7 +16,7 @@ async fn upload_files(
     files: Vec<File>,
     payment_orders: State<'_, PaymentOrderManager>,
 ) -> Result<(), ()> {
-    ant::files::upload_files(app, files, "archive_name", payment_orders).await;
+    ant::files::upload_private_files_to_vault(app, files, payment_orders).await;
     Ok(())
 }
 
