@@ -4,8 +4,8 @@ use autonomi::client::data::DataMapChunk;
 use autonomi::client::files::archive::Metadata;
 use autonomi::client::quote::StoreQuote;
 use autonomi::{Bytes, Chunk};
+use rand::Rng;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
@@ -138,4 +138,73 @@ pub async fn upload_private_files_to_vault(
     // upload chunks and archive
 
     todo!()
+}
+
+pub async fn payment_test(app: AppHandle, payment_orders: State<'_, PaymentOrderManager>) {
+    println!("Running test!");
+
+    println!("Connecting to client..");
+
+    let client = client().await;
+
+    println!("Client connected!");
+
+    let bytes: Vec<u8> = (0..1024).map(|_| rand::thread_rng().gen()).collect();
+
+    println!("Encrypting bytes..");
+
+    let (_datamap, chunks) = autonomi::self_encryption::encrypt(Bytes::from(bytes)).unwrap();
+
+    println!("Got chunks!");
+
+    let chunk_addresses: Vec<_> = chunks
+        .iter()
+        .map(|chunk| *chunk.address.xorname())
+        .collect();
+
+    println!("Getting quotes..");
+
+    let store_quote = client
+        .get_store_quotes(chunk_addresses.into_iter())
+        .await
+        .unwrap();
+
+    println!("Got quotes!");
+
+    let (payment_order, mut confirmation_receiver) =
+        payment_orders.create_order(store_quote.payments());
+
+    // let the frontend know that a payment has to be made
+    app.emit("payment-order", payment_order.to_json()).unwrap();
+
+    let order_successful = tokio::spawn(async move {
+        loop {
+            let result = timeout(
+                Duration::from_secs(IDLE_PAYMENT_TIMEOUT_SECS),
+                confirmation_receiver.recv(),
+            )
+            .await;
+
+            match result {
+                Ok(Some(order_message)) => match order_message {
+                    OrderMessage::KeepAlive => {
+                        continue;
+                    }
+                    OrderMessage::Completed => {
+                        return true;
+                    }
+                    OrderMessage::Cancelled => {
+                        return false;
+                    }
+                },
+                _ => {
+                    return false;
+                }
+            };
+        }
+    })
+    .await
+    .unwrap();
+
+    println!("Order paid: {order_successful}");
 }
