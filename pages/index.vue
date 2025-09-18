@@ -29,20 +29,20 @@ const handleGetStarted = () => {
   <div>
     <div class="px-[66px] lg:px-[110px] pt-[70px]" v-if="!wallet.isConnected">
       <h1
-        class="text-4xl font-semibold leading-[54px] text-autonomi-header-text"
+        class="text-4xl font-semibold leading-[54px] text-autonomi-header-text dark:text-autonomi-text-primary-dark"
       >
         Welcome to Autonomi
       </h1>
       <p class="mt-4 text-autonomi-text-primary">
         Welcome to the Autonomi vault. This is a secure private data store
-        linked to your wallet, accessible from anywhere. You will need to link a
+        linked to your mobile wallet, accessible from anywhere. You will need to link a
         wallet in order to pay for the upload and gas fees. Once you have linked
-        your wallet, you will be able to see any files associated with it. You
+        your mobile wallet, you will be able to see any files associated with it. You
         can also upload new files from here. To get started, press the button
         below.
       </p>
 
-      <div v-if="!wallet.connected">
+      <div v-if="!wallet.isConnected">
         <CommonButton
           variant="secondary"
           size="medium"
@@ -57,6 +57,9 @@ const handleGetStarted = () => {
         <div class="mt-10">Data: {{ wallet }}</div>
       </div> -->
     </div>
-    <FileViewer v-else />
+    <FileViewer v-else 
+      @show-notify="$emit('show-notify', $event)"
+      @hide-notify="$emit('hide-notify')"
+    />
   </div>
 </template>

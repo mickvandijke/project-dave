@@ -1,75 +1,51 @@
-# Nuxt Minimal Starter
+# Dave
 
-Look at the [Nuxt documentation](https://nuxt.com/docs/getting-started/introduction) to learn more.
+Dave is a client app for managing your Vault on the Autonomi network.
 
-## Setup
+## Features
 
-Make sure to install dependencies:
+- **File Uploading**: Upload files and folders publicly or privately to Autonomi.
+- **Vault Management**: Manage your local and network Vault.
+- **Web3 Wallet Integration**: Secure access and payments via Web3 wallet.
 
-```bash
-# npm
-npm install
+## Installation
 
-# pnpm
-pnpm install
+Download the latest version from the [releases page](https://github.com/maidsafe/project-dave/releases):
 
-# yarn
-yarn install
+- Windows (.msi installer)
+- macOS (.dmg)
+- Linux (.AppImage or .deb)
 
-# bun
-bun install
-```
+## Using Dave with Your Wallet
 
-## Development Server
+Dave uses Web3 wallets for secure Vault access and upload payments on the Arbitrum One network.
 
-Start the development server on `http://localhost:3000`:
+### Setting Up Your Wallet
 
-```bash
-# npm
-npm run dev
+1. **Install a Web3 Wallet**: Dave supports mobile wallets through WalletConnect
+    - Popular options include MetaMask Mobile, Rainbow, or Trust Wallet
 
-# pnpm
-pnpm dev
+2. **Connect in Dave**:
+    - Click the wallet button in Dave
+    - Scan the QR code with your mobile wallet
+    - Approve the connection
 
-# yarn
-yarn dev
+3. **Fund Your Wallet**: You'll need ETH and Autonomi tokens on Arbitrum One for upload payments
 
-# bun
-bun run dev
-```
+### Basic Usage
 
-## Production
+#### Uploading Files
 
-Build the application for production:
+1. Click the plus (+) button on the Files page
+2. Select files or folders from your computer
+3. Choose upload type:
+    - **Private**: Encrypted files with data map kept locally (can be shared via datamap hex)
+    - **Public**: Encrypted files with data map uploaded publicly for sharing via data address
+4. Sign with your wallet when prompted
+5. Confirm payment if required
 
-```bash
-# npm
-npm run build
+## Support
 
-# pnpm
-pnpm build
-
-# yarn
-yarn build
-
-# bun
-bun run build
-```
-
-Locally preview production build:
-
-```bash
-# npm
-npm run preview
-
-# pnpm
-pnpm preview
-
-# yarn
-yarn preview
-
-# bun
-bun run preview
-```
-
-Check out the [deployment documentation](https://nuxt.com/docs/getting-started/deployment) for more information.
+- Learn more at [autonomi.com](https://autonomi.com/)
+- Join our [Discord](https://discord.com/invite/autonomi)
+- Visit the [Forum](https://forum.autonomi.community/)
