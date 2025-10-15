@@ -161,23 +161,39 @@ jobs:
           echo "Release assets created:"
           ls -la release-assets/
 
+      - name: Check if release exists
+        id: check_release
+        run: |
+          TAG="app-v${{ steps.get_version.outputs.VERSION }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists!"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "Release $TAG does not exist, proceeding..."
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create Release
         id: create_release
+        if: steps.check_release.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: app-v${{ steps.get_version.outputs.VERSION }}
           name: Dave v${{ steps.get_version.outputs.VERSION }}
           body: |
             Download Dave for your platform:
-            
+
             ## 🍎 macOS
             - **Intel**: [`project-dave_${{ steps.get_version.outputs.VERSION }}_macos-x86_64-apple-darwin.dmg`](https://github.com/${{ github.repository }}/releases/download/app-v${{ steps.get_version.outputs.VERSION }}/project-dave_${{ steps.get_version.outputs.VERSION }}_macos-x86_64-apple-darwin.dmg)
             - **Apple Silicon**: [`project-dave_${{ steps.get_version.outputs.VERSION }}_macos-aarch64-apple-darwin.dmg`](https://github.com/${{ github.repository }}/releases/download/app-v${{ steps.get_version.outputs.VERSION }}/project-dave_${{ steps.get_version.outputs.VERSION }}_macos-aarch64-apple-darwin.dmg)
-            
+
             ## 🐧 Linux
             - **x64 AppImage**: [`project-dave_${{ steps.get_version.outputs.VERSION }}_linux-x86_64-unknown-linux-gnu.AppImage`](https://github.com/${{ github.repository }}/releases/download/app-v${{ steps.get_version.outputs.VERSION }}/project-dave_${{ steps.get_version.outputs.VERSION }}_linux-x86_64-unknown-linux-gnu.AppImage)
             - **x64 Debian Package**: [`project-dave_${{ steps.get_version.outputs.VERSION }}_linux-x86_64-unknown-linux-gnu.deb`](https://github.com/${{ github.repository }}/releases/download/app-v${{ steps.get_version.outputs.VERSION }}/project-dave_${{ steps.get_version.outputs.VERSION }}_linux-x86_64-unknown-linux-gnu.deb)
-            
+
             ## 🪟 Windows
             - **x64 Executable**: [`project-dave_${{ steps.get_version.outputs.VERSION }}_windows-x86_64-pc-windows-msvc.exe`](https://github.com/${{ github.repository }}/releases/download/app-v${{ steps.get_version.outputs.VERSION }}/project-dave_${{ steps.get_version.outputs.VERSION }}_windows-x86_64-pc-windows-msvc.exe)
           draft: true
