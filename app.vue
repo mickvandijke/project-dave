@@ -1,25 +1,8 @@
 <script lang="ts" setup>
-import {createAppKit} from '@reown/appkit/vue';
-import {networks, projectId, wagmiAdapter} from '~/config';
 import {useFileStore} from '~/stores/files';
 import {storeToRefs} from 'pinia';
 import {reconnect} from '@wagmi/core';
-
-createAppKit({
-  adapters: [wagmiAdapter],
-  networks,
-  metadata: {
-    name: 'Autonomi',
-    description: 'Autonomi',
-    url: 'https://reown.com/appkit',
-    icons: ['https://avatars.githubusercontent.com/u/179229932?s=200&v=4'],
-  },
-  projectId,
-  features: {
-    socials: false,
-    email: false,
-  },
-});
+import {wagmiConfig} from '~/config';
 
 const classesLinks = `w-full h-[64px] text-lg flex items-center justify-start text-autonomi-text-primary hover:text-autonomi-text-secondary dark:text-autonomi-text-primary-dark gap-3 transition-all duration-300 cursor-pointer dark:hover:text-white`;
 
@@ -72,10 +55,10 @@ watchEffect(() => {
 
 onMounted(async () => {
   // Attempt to reconnect wallet on app startup after a short delay
-  // to ensure AppKit is fully initialized
+  // to ensure Wagmi is fully initialized
   setTimeout(async () => {
     try {
-      await reconnect(wagmiAdapter.wagmiConfig);
+      await reconnect(wagmiConfig);
       console.log('Wallet reconnection attempted');
     } catch (error) {
       console.error('Failed to reconnect wallet:', error);

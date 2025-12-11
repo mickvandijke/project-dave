@@ -14,8 +14,6 @@
   "dependencies": {
     "@pinia/nuxt": "^0.5.5",
     "@primevue/themes": "^4.1.0",
-    "@reown/appkit": "^1.8.14",
-    "@reown/appkit-adapter-wagmi": "^1.8.14",
     "@tanstack/vue-query": "^5.92.1",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.2.0",
@@ -23,7 +21,10 @@
     "@tauri-apps/plugin-process": "^2.2.0",
     "@tauri-apps/plugin-shell": "^2",
     "@tauri-apps/plugin-updater": "^2.3.0",
+    "@wagmi/connectors": "^7.0.0",
+    "@wagmi/core": "^3.0.0",
     "@wagmi/vue": "^0.4.3",
+    "@web3modal/wagmi": "^5.1.11",
     "nuxt": "^3.14.1592",
     "permissionless": "^0.2.57",
     "primeicons": "^7.0.0",
@@ -31,7 +32,8 @@
     "tailwindcss-primeui": "^0.3.4",
     "viem": "^2.41.2",
     "vue": "^3.3.4",
-    "vue-router": "latest"
+    "vue-router": "latest",
+    "wagmi": "^3.0.0"
   },
   "devDependencies": {
     "@primevue/nuxt-module": "^4.1.0",

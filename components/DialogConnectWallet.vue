@@ -20,7 +20,7 @@ const handleCloseLogIn = () => {
 
 const handleLogIn = async () => {
   try {
-    console.log(">>> Running login");
+    console.log(">>> Running login with WalletConnect");
 
     const response = await walletStore.connectWallet();
 
@@ -30,17 +30,25 @@ const handleLogIn = async () => {
       if (callbackConnectWallet.value) {
         callbackConnectWallet.value();
       }
+      emit("close-login");
     } else {
-      throw new Error("Failed to log in");
+      // Show error toast with the actual error message
+      toast.add({
+        severity: "error",
+        summary: "Connection Failed",
+        detail: response.message || "Failed to connect wallet",
+        life: 5000,
+      });
+      emit("close-login");
     }
-  } catch (error) {
+  } catch (error: any) {
+    console.error("Unexpected error during wallet connection:", error);
     toast.add({
       severity: "error",
       summary: "Error",
-      detail: "TEST: Failed to log in",
-      life: 3000,
+      detail: error.message || "Failed to connect wallet",
+      life: 5000,
     });
-  } finally {
     emit("close-login");
   }
 };
@@ -68,16 +76,16 @@ const handleLogIn = async () => {
           <i class="pi pi-spin pi-spinner"/>
           <span>Connecting...</span>
         </div>
-        <div v-else class="flex items-center gap-4 flex-wrap justify-center">
+        <div v-else class="flex flex-col gap-4">
+          <CommonButton variant="primary" size="large" @click="handleLogIn">
+            <i class="pi pi-qrcode"/> Connect Wallet
+          </CommonButton>
           <CommonButton
               variant="tertiary"
               size="large"
               @click="handleCloseLogIn"
           >
             Cancel
-          </CommonButton>
-          <CommonButton variant="primary" size="large" @click="handleLogIn">
-            <i class="pi pi-wallet"/> Connect Your Mobile Wallet
           </CommonButton>
         </div>
       </div>

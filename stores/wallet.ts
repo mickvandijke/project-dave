@@ -1,4 +1,4 @@
-import {useAppKit, useAppKitAccount, useDisconnect} from "@reown/appkit/vue";
+import {useAccount, useConnect, useDisconnect} from "@wagmi/vue";
 import {
     getBalance,
     getChainId,
@@ -27,7 +27,7 @@ import tokenAbi from "~/assets/abi/PaymentToken.json";
 import paymentVaultAbi from "~/assets/abi/IPaymentVault.json";
 import paymasterAbi from "~/assets/abi/AutonomiPaymaster.json";
 import permitAbi from "~/assets/abi/Permit.json";
-import {wagmiAdapter} from "~/config";
+import {wagmiConfig} from "~/config";
 import {PAYMASTER_ADDRESS, PIMLICO_API_KEY} from "~/config/paymaster";
 import {
     createPimlicoSmartAccountClient,
@@ -43,105 +43,6 @@ const tokenContractAddress = "0xa78d8321B20c4Ef90eCd72f2588AA985A4BDb684";
 const paymentVaultContractAddress = "0xB1b5219f8Aaa18037A2506626Dd0406a46f70BcC";
 const VAULT_SECRET_KEY_SEED = "Massive Array of Internet Disks Secure Access For Everyone";
 const MAX_PAYMENTS_PER_TRANSACTION = 256;
-
-let isSetWalletModalListener = false;
-
-const handleObserveHideModalElements = (walletModal: HTMLElement) => {
-    try {
-        const walletModalShadow = walletModal.shadowRoot as ShadowRoot;
-
-        const hideModalElements = debounce(() => {
-            try {
-                const mobileTabHeader = walletModalShadow.querySelector('w3m-router')?.shadowRoot?.querySelector('w3m-connecting-wc-view')?.shadowRoot?.querySelector('w3m-connecting-header');
-
-                const copyLink = walletModalShadow.querySelector('w3m-router')?.shadowRoot?.querySelector('w3m-connecting-wc-view')?.shadowRoot?.querySelector('w3m-connecting-wc-qrcode')?.shadowRoot?.querySelector('wui-link');
-
-                const mobileDownloadLinks = walletModalShadow.querySelector('w3m-router')?.shadowRoot?.querySelector('w3m-connecting-wc-view')?.shadowRoot?.querySelector('w3m-connecting-wc-qrcode')?.shadowRoot?.querySelector('w3m-mobile-download-links')?.shadowRoot?.querySelector('wui-cta-button');
-
-                const getStartedLink = walletModalShadow.querySelector('w3m-router')?.shadowRoot?.querySelector('w3m-connect-view')?.shadowRoot?.querySelector('w3m-wallet-guide');
-
-                const buttonWalletConnect = walletModalShadow.querySelector('w3m-router')?.shadowRoot?.querySelector('w3m-connect-view')?.shadowRoot?.querySelector('w3m-wallet-login-list')?.shadowRoot?.querySelector('w3m-connector-list')?.shadowRoot?.querySelector('w3m-connect-walletconnect-widget');
-
-                const modalHeaderText = walletModalShadow.querySelector('w3m-header')?.shadowRoot?.querySelector('wui-text');
-
-                const buttonAllWallets = walletModalShadow.querySelector('w3m-router')?.shadowRoot?.querySelector('w3m-connect-view')?.shadowRoot?.querySelector('w3m-wallet-login-list')?.shadowRoot?.querySelector('w3m-all-wallets-widget')?.shadowRoot?.querySelector('wui-list-wallet')?.shadowRoot?.querySelector('button')?.querySelector('wui-text');
-
-                const buttonGetAWallet = walletModalShadow.querySelector('w3m-router')?.shadowRoot?.querySelector('w3m-what-is-a-wallet-view')?.shadowRoot?.querySelector('wui-button');
-
-                const scanQrCodeText = walletModalShadow.querySelector('w3m-router')?.shadowRoot?.querySelector('w3m-connecting-wc-view')?.shadowRoot?.querySelector('w3m-connecting-wc-qrcode')?.shadowRoot?.querySelector('wui-text');
-
-                let walletName = '';
-
-                if (modalHeaderText) {
-
-                    const connectWalletRegex = /Connect\s+Wallet/i;
-                    const isConnectWallet = connectWalletRegex.test(modalHeaderText.innerHTML); // Connect Wallet is the header
-                    const placeholderElement = modalHeaderText.parentElement?.querySelector('.autonomi-header');
-
-                    if (isConnectWallet) {
-                        if (!placeholderElement) {
-                            // Add the updated connect mobile wallet element if it doesn't exist
-                            modalHeaderText.parentElement?.insertAdjacentHTML('beforeend', '<span class="autonomi-header" style="font-size: 14px; font-weight: 600; color: #ffffff;">Connect Mobile Wallet</span>');
-                        }
-
-                        modalHeaderText.style.position = 'absolute';
-                        modalHeaderText.style.left = '-9999px';
-                    } else {
-                        // Show header
-                        modalHeaderText.style.position = 'relative';
-                        modalHeaderText.style.left = '0px';
-                        placeholderElement?.remove();
-                        // Set wallet name
-                        walletName = modalHeaderText.textContent || '';
-                    }
-                }
-
-                if (buttonAllWallets) {
-                    buttonAllWallets.textContent = "All Mobile Wallets";
-                }
-
-                if (mobileTabHeader) {
-                    mobileTabHeader.hidden = true;
-                }
-
-                if (copyLink) {
-                    copyLink.hidden = true;
-                }
-
-                if (mobileDownloadLinks) {
-                    mobileDownloadLinks.hidden = true;
-                }
-
-                if (getStartedLink) {
-                    getStartedLink.hidden = true;
-                }
-
-                if (buttonWalletConnect) {
-                    buttonWalletConnect.hidden = true;
-                }
-
-                if (buttonGetAWallet) {
-                    buttonGetAWallet.hidden = true;
-                }
-
-                if (scanQrCodeText) {
-                    scanQrCodeText.innerHTML = `<span style="display: block; text-align: center;">Download ${walletName} on your mobile device then scan this QR code.</span>`
-                }
-            } catch (error) {
-                // TODO: Handle error
-            }
-        }, 75)
-
-        const observer = new MutationObserver((mutationsList) => {
-            mutationsList.forEach((mutation) => {
-                hideModalElements()
-            })
-        })
-
-        observer.observe(walletModalShadow, {attributes: true, childList: true, subtree: true});
-    } catch (error) {
-    }
-}
 
 
 export const useWalletStore = defineStore("wallet", () => {
@@ -159,32 +60,74 @@ export const useWalletStore = defineStore("wallet", () => {
     const balancesLoading = ref(false);
     const balanceRefreshInterval = ref<NodeJS.Timeout | null>(null);
 
-    const wallet = useAppKitAccount();
-    const {open, switchNetwork} = useAppKit();
-    const {disconnect} = useDisconnect();
+    // Use Wagmi composables
+    const account = useAccount({ config: wagmiConfig });
+    const { connectAsync, connectors } = useConnect({ config: wagmiConfig });
+    const { disconnectAsync } = useDisconnect({ config: wagmiConfig });
+
+    // Create wallet object for backward compatibility
+    const wallet = computed(() => ({
+        address: account.address.value as string | undefined,
+        isConnected: account.isConnected.value,
+        chainId: account.chainId.value,
+        status: account.status.value
+    }));
 
     const connectWallet = async () => {
         try {
             pendingConnectWallet.value = true;
 
-            const connectResponse = await open();
+            console.log("Opening Web3Modal for WalletConnect...");
 
-            // Get wallet modal reference
-            const walletModal = document.querySelector('w3m-modal') as HTMLElement | null;
+            try {
+                // Import dynamically to ensure it's only loaded on client side
+                const { createWeb3Modal } = await import('@web3modal/wagmi');
+                const { arbitrum } = await import('@wagmi/core/chains');
+                const { projectId } = await import('~/config');
 
-            // Add observer
-            if (!isSetWalletModalListener) {
-                walletModal && handleObserveHideModalElements(walletModal)
-                isSetWalletModalListener = true
+                // Create and open the modal
+                const modal = createWeb3Modal({
+                    wagmiConfig,
+                    projectId,
+                    chains: [arbitrum],
+                    themeMode: 'dark',
+                    themeVariables: {
+                        '--w3m-z-index': '9999'
+                    }
+                });
+
+                // Open the modal
+                await modal.open();
+
+                console.log("Web3Modal opened");
+
+                // The modal will handle the connection, wait for wallet to connect
+                // We'll return success here and let the account watcher handle the state
+                return {
+                    success: true,
+                };
+            } catch (modalError) {
+                console.error("Error opening Web3Modal:", modalError);
+                throw modalError;
+            }
+        } catch (error: any) {
+            console.error("Error connecting wallet:", error);
+
+            // Check if user rejected the connection
+            if (error.message?.includes('User rejected') ||
+                error.message?.includes('User denied') ||
+                error.message?.includes('User canceled') ||
+                error.name === 'UserRejectedRequestError' ||
+                error.name === 'ConnectorNotFoundError') {
+                return {
+                    success: false,
+                    message: "Connection cancelled by user",
+                };
             }
 
             return {
-                success: true,
-            };
-        } catch (error) {
-            return {
                 success: false,
-                message: "Error connecting wallet",
+                message: error.message || "Error connecting wallet",
             };
         } finally {
             pendingConnectWallet.value = false;
@@ -195,7 +138,7 @@ export const useWalletStore = defineStore("wallet", () => {
         try {
             pendingDisconnectWallet.value = true;
 
-            await disconnect();
+            await disconnectAsync();
 
             // Clear cached vault key signature on disconnect
             cachedVaultKeySignature.value = undefined;
@@ -262,7 +205,7 @@ export const useWalletStore = defineStore("wallet", () => {
 
             // Check if this is a chain mismatch error from Wagmi
             if (error.message?.includes('does not match') || error.message?.includes('chain')) {
-                const currentChainId = getChainId(wagmiAdapter.wagmiConfig);
+                const currentChainId = getChainId(wagmiConfig);
                 throw new Error(`Wrong network detected. Please switch your wallet from chain ${currentChainId} to Arbitrum One (chain 42161)`);
             }
 
@@ -299,7 +242,7 @@ export const useWalletStore = defineStore("wallet", () => {
         for (const batch of batches) {
             let input = batch.map(([quoteHash, rewardsAddress, amountStr]) => [rewardsAddress, amountStr, quoteHash]);
 
-            let txHash = await writeContract(wagmiAdapter.wagmiConfig, {
+            let txHash = await writeContract(wagmiConfig, {
                 abi: paymentVaultAbi,
                 address: paymentVaultContractAddress,
                 functionName: "payForQuotes",
@@ -309,7 +252,7 @@ export const useWalletStore = defineStore("wallet", () => {
             await new Promise(resolve => setTimeout(resolve, 1000));
 
             // wait for transaction
-            let _receipt = await waitForTransactionReceipt(wagmiAdapter.wagmiConfig, {hash: txHash});
+            let _receipt = await waitForTransactionReceipt(wagmiConfig, {hash: txHash});
 
             txHashes.push(txHash);
         }
@@ -328,7 +271,7 @@ export const useWalletStore = defineStore("wallet", () => {
         requiredAmount: bigint
     ): Promise<void> => {
         // Check smart account ANT balance
-        const smartAccountBalance = await readContract(wagmiAdapter.wagmiConfig, {
+        const smartAccountBalance = await readContract(wagmiConfig, {
             abi: tokenAbi,
             address: tokenContractAddress,
             functionName: "balanceOf",
@@ -350,7 +293,7 @@ export const useWalletStore = defineStore("wallet", () => {
         console.log("Smart account is missing ANT amount:", transferAmount);
 
         // Check EOA has enough ANT balance
-        const eoaBalance = await readContract(wagmiAdapter.wagmiConfig, {
+        const eoaBalance = await readContract(wagmiConfig, {
             abi: tokenAbi,
             address: tokenContractAddress,
             functionName: "balanceOf",
@@ -558,7 +501,7 @@ export const useWalletStore = defineStore("wallet", () => {
         }
 
         // Get wallet client for signing
-        const walletClient = await getWalletClient(wagmiAdapter.wagmiConfig);
+        const walletClient = await getWalletClient(wagmiConfig);
         if (!walletClient) {
             console.error("Wallet client not available");
             throw new Error("Something went wrong. Please try again.");
@@ -752,7 +695,7 @@ export const useWalletStore = defineStore("wallet", () => {
 
     const approveTokens = async (spenderAddress: string, approveAmount: bigint) => {
         try {
-            let txHash = await writeContract(wagmiAdapter.wagmiConfig, {
+            let txHash = await writeContract(wagmiConfig, {
                 abi: tokenAbi,
                 address: tokenContractAddress,
                 functionName: "approve",
@@ -761,7 +704,7 @@ export const useWalletStore = defineStore("wallet", () => {
 
             console.log("Approval transaction sent:", txHash);
 
-            const receipt = await waitForTransactionReceipt(wagmiAdapter.wagmiConfig, {hash: txHash});
+            const receipt = await waitForTransactionReceipt(wagmiConfig, {hash: txHash});
 
             console.log("Approval transaction receipt:", receipt);
         } catch (error) {
@@ -773,7 +716,7 @@ export const useWalletStore = defineStore("wallet", () => {
 
     const getAllowance = async (ownerAddress: string, spenderAddress: string): Promise<bigint> => {
         try {
-            const result = await readContract(wagmiAdapter.wagmiConfig, {
+            const result = await readContract(wagmiConfig, {
                 abi: tokenAbi,
                 address: tokenContractAddress,
                 functionName: "allowance",
@@ -824,7 +767,7 @@ export const useWalletStore = defineStore("wallet", () => {
         console.log("Signing message:", hex);
 
         try {
-            return await signMessage(wagmiAdapter.wagmiConfig, {
+            return await signMessage(wagmiConfig, {
                 message: {raw: hex},
             });
         } catch (error) {
@@ -852,7 +795,7 @@ export const useWalletStore = defineStore("wallet", () => {
         }
 
         try {
-            const balance = await getBalance(wagmiAdapter.wagmiConfig, {
+            const balance = await getBalance(wagmiConfig, {
                 address: wallet.value.address,
             });
 
@@ -869,14 +812,14 @@ export const useWalletStore = defineStore("wallet", () => {
         }
 
         try {
-            const balance = await readContract(wagmiAdapter.wagmiConfig, {
+            const balance = await readContract(wagmiConfig, {
                 abi: tokenAbi,
                 address: tokenContractAddress,
                 functionName: "balanceOf",
                 args: [wallet.value.address]
             });
 
-            const decimals = await readContract(wagmiAdapter.wagmiConfig, {
+            const decimals = await readContract(wagmiConfig, {
                 abi: tokenAbi,
                 address: tokenContractAddress,
                 functionName: "decimals",
@@ -950,7 +893,7 @@ export const useWalletStore = defineStore("wallet", () => {
         }
 
         // Check current chain ID using Wagmi's getChainId
-        const currentChainId = getChainId(wagmiAdapter.wagmiConfig);
+        const currentChainId = getChainId(wagmiConfig);
         const expectedChainId = arbitrum.id; // 42161 for Arbitrum One
 
         console.log('[ensureCorrectChain] Current chain ID:', currentChainId, `(0x${currentChainId.toString(16)})`);
@@ -960,20 +903,9 @@ export const useWalletStore = defineStore("wallet", () => {
             console.log('[ensureCorrectChain] Chain mismatch detected, switching to Arbitrum One...');
 
             try {
-                // Try AppKit's switchNetwork first (works better with the wallet modal)
-                console.log('[ensureCorrectChain] Attempting switch via AppKit.switchNetwork...');
-                try {
-                    await switchNetwork(arbitrum);
-                    console.log('[ensureCorrectChain] Successfully switched via AppKit');
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                    return;
-                } catch (appKitError) {
-                    console.warn('[ensureCorrectChain] AppKit switch failed, trying Wagmi switchChain...', appKitError);
-                }
-
-                // Fallback to Wagmi's switchChain
+                // Use Wagmi's switchChain
                 console.log('[ensureCorrectChain] Calling Wagmi switchChain with chainId:', expectedChainId);
-                const result = await switchChain(wagmiAdapter.wagmiConfig, {
+                const result = await switchChain(wagmiConfig, {
                     chainId: expectedChainId
                 });
                 console.log('[ensureCorrectChain] switchChain result:', result);
@@ -1019,7 +951,7 @@ export const useWalletStore = defineStore("wallet", () => {
             throw new Error("Pimlico API key not configured");
         }
 
-        const walletClient = await getWalletClient(wagmiAdapter.wagmiConfig);
+        const walletClient = await getWalletClient(wagmiConfig);
         if (!walletClient) {
             console.error("Wallet client not available");
             throw new Error("Something went wrong. Please try again.");
@@ -1028,7 +960,7 @@ export const useWalletStore = defineStore("wallet", () => {
         const smartAccount = await getSmartAccount(walletClient, arbitrum);
 
         // Check smart account ANT balance
-        const antBalance = await readContract(wagmiAdapter.wagmiConfig, {
+        const antBalance = await readContract(wagmiConfig, {
             abi: tokenAbi,
             address: tokenContractAddress,
             functionName: "balanceOf",
@@ -1069,7 +1001,7 @@ export const useWalletStore = defineStore("wallet", () => {
         }
 
         console.log('[estimatePaymasterCosts] Getting wallet client...');
-        const walletClient = await getWalletClient(wagmiAdapter.wagmiConfig);
+        const walletClient = await getWalletClient(wagmiConfig);
         if (!walletClient) {
             console.error("Wallet client not available");
             throw new Error("Something went wrong. Please try again.");
@@ -1175,7 +1107,7 @@ export const useWalletStore = defineStore("wallet", () => {
         } else {
             console.log('[estimatePaymasterCosts] Reading smart account balance...');
             try {
-                const balancePromise = readContract(wagmiAdapter.wagmiConfig, {
+                const balancePromise = readContract(wagmiConfig, {
                     abi: tokenAbi,
                     address: tokenContractAddress,
                     functionName: "balanceOf",
@@ -1300,7 +1232,7 @@ export const useWalletStore = defineStore("wallet", () => {
             throw new Error("Pimlico API key not configured");
         }
 
-        const walletClient = await getWalletClient(wagmiAdapter.wagmiConfig);
+        const walletClient = await getWalletClient(wagmiConfig);
         if (!walletClient) {
             console.error("Wallet client not available");
             throw new Error("Something went wrong. Please try again.");
@@ -1320,7 +1252,7 @@ export const useWalletStore = defineStore("wallet", () => {
         });
 
         // Check EOA has enough ANT balance
-        const eoaBalance = await readContract(wagmiAdapter.wagmiConfig, {
+        const eoaBalance = await readContract(wagmiConfig, {
             abi: tokenAbi,
             address: tokenContractAddress,
             functionName: "balanceOf",
