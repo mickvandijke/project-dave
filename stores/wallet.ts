@@ -1,9 +1,13 @@
 import {useAccount, useConnect, useDisconnect} from "@wagmi/vue";
 import {
+    disconnect,
+    getAccount,
     getBalance,
     getChainId,
+    getConnections,
     getWalletClient,
     readContract,
+    reconnect,
     signMessage,
     switchChain,
     waitForTransactionReceipt,
@@ -44,6 +48,8 @@ const paymentVaultContractAddress = "0xB1b5219f8Aaa18037A2506626Dd0406a46f70BcC"
 const VAULT_SECRET_KEY_SEED = "Massive Array of Internet Disks Secure Access For Everyone";
 const MAX_PAYMENTS_PER_TRANSACTION = 256;
 
+// Singleton Web3Modal instance to prevent conflicts
+let web3ModalInstance: any = null;
 
 export const useWalletStore = defineStore("wallet", () => {
     // State
@@ -77,35 +83,61 @@ export const useWalletStore = defineStore("wallet", () => {
         try {
             pendingConnectWallet.value = true;
 
-            console.log("Opening Web3Modal for WalletConnect...");
-
             try {
-                // Import dynamically to ensure it's only loaded on client side
-                const { createWeb3Modal } = await import('@web3modal/wagmi');
-                const { arbitrum } = await import('@wagmi/core/chains');
-                const { projectId } = await import('~/config');
+                // Create singleton instance if it doesn't exist
+                if (!web3ModalInstance) {
+                    const { createWeb3Modal } = await import('@web3modal/wagmi');
+                    const { arbitrum } = await import('@wagmi/core/chains');
+                    const { projectId } = await import('~/config');
 
-                // Create and open the modal
-                const modal = createWeb3Modal({
-                    wagmiConfig,
-                    projectId,
-                    chains: [arbitrum],
-                    themeMode: 'dark',
-                    themeVariables: {
-                        '--w3m-z-index': '9999'
-                    }
-                });
+                    web3ModalInstance = createWeb3Modal({
+                        wagmiConfig,
+                        projectId,
+                        chains: [arbitrum],
+                        themeMode: 'dark',
+                        themeVariables: {
+                            '--w3m-z-index': '9999'
+                        }
+                    });
+                }
 
                 // Open the modal
-                await modal.open();
+                await web3ModalInstance.open();
 
-                console.log("Web3Modal opened");
+                // Poll and force reconnect to pick up the WalletConnect session
+                return new Promise(async (resolve) => {
+                    let resolved = false;
+                    let pollCount = 0;
+                    const maxPolls = 60; // 30 seconds of polling
+                    let reconnectAttempted = false;
 
-                // The modal will handle the connection, wait for wallet to connect
-                // We'll return success here and let the account watcher handle the state
-                return {
-                    success: true,
-                };
+                    const pollInterval = setInterval(async () => {
+                        pollCount++;
+
+                        const accountState = getAccount(wagmiConfig);
+
+                        // If status is 'connecting' and we haven't tried reconnect yet, do it now
+                        if (accountState.status === 'connecting' && !reconnectAttempted && pollCount > 3) {
+                            reconnectAttempted = true;
+                            try {
+                                await reconnect(wagmiConfig);
+                            } catch (err) {
+                                console.error("Reconnect error:", err);
+                            }
+                        }
+
+                        // Check if connected
+                        if (accountState.isConnected && accountState.address) {
+                            resolved = true;
+                            clearInterval(pollInterval);
+                            resolve({ success: true });
+                        } else if (pollCount >= maxPolls) {
+                            resolved = true;
+                            clearInterval(pollInterval);
+                            resolve({ success: false, message: "Connection timeout" });
+                        }
+                    }, 500);
+                });
             } catch (modalError) {
                 console.error("Error opening Web3Modal:", modalError);
                 throw modalError;
@@ -138,12 +170,32 @@ export const useWalletStore = defineStore("wallet", () => {
         try {
             pendingDisconnectWallet.value = true;
 
-            await disconnectAsync();
+            // Get all active connections and disconnect them
+            const connections = getConnections(wagmiConfig);
+
+            // Disconnect all connections
+            for (const connection of connections) {
+                await disconnect(wagmiConfig, { connector: connection.connector });
+            }
+
+            // Also try the composable disconnect for good measure
+            try {
+                await disconnectAsync();
+            } catch (err) {
+                // Ignore errors
+            }
+
+            // Close the Web3Modal if it's open
+            if (web3ModalInstance) {
+                try {
+                    await web3ModalInstance.close();
+                } catch (err) {
+                    console.error("Error closing Web3Modal:", err);
+                }
+            }
 
             // Clear cached vault key signature on disconnect
             cachedVaultKeySignature.value = undefined;
-
-            console.log("Disconnected wallet");
 
             if (callbackDisconnectWallet.value) {
                 callbackDisconnectWallet.value();
@@ -153,6 +205,7 @@ export const useWalletStore = defineStore("wallet", () => {
                 success: true,
             };
         } catch (error) {
+            console.error("Error disconnecting wallet:", error);
             return {
                 success: false,
                 message: "Error disconnecting wallet",
