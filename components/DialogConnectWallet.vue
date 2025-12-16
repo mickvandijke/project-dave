@@ -32,12 +32,17 @@ const handleLogIn = async () => {
       }
       emit("close-login");
     } else {
+      // If wrong chain, disconnect the wallet first
+      if (response.wrongChain) {
+        await walletStore.disconnectWallet();
+      }
+
       // Show error toast with the actual error message
       toast.add({
         severity: "error",
-        summary: "Connection Failed",
+        summary: response.wrongChain ? "Wrong Network" : "Connection Failed",
         detail: response.message || "Failed to connect wallet",
-        life: 5000,
+        life: 8000,
       });
       emit("close-login");
     }

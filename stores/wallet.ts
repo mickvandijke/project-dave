@@ -130,7 +130,17 @@ export const useWalletStore = defineStore("wallet", () => {
                         if (accountState.isConnected && accountState.address) {
                             resolved = true;
                             clearInterval(pollInterval);
-                            resolve({ success: true });
+
+                            // Check if on correct chain (Arbitrum One = 42161)
+                            if (accountState.chainId !== arbitrum.id) {
+                                resolve({
+                                    success: false,
+                                    message: `Wrong network detected. Please switch your wallet to Arbitrum One (chain ${arbitrum.id}). Currently on chain ${accountState.chainId}.`,
+                                    wrongChain: true
+                                });
+                            } else {
+                                resolve({ success: true });
+                            }
                         } else if (pollCount >= maxPolls) {
                             resolved = true;
                             clearInterval(pollInterval);
