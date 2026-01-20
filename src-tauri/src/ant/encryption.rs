@@ -4,7 +4,9 @@ use tracing::{error, info};
 
 #[derive(Debug)]
 pub(crate) enum EncryptionError {
+    #[allow(dead_code)]
     Encryption(String),
+    #[allow(dead_code)]
     IO(String),
 }
 

@@ -5,6 +5,7 @@ use autonomi::Client;
 
 #[derive(Debug)]
 pub(crate) enum UploadError {
+    #[allow(dead_code)]
     Put(String),
 }
 

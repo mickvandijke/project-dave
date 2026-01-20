@@ -1,6 +1,13 @@
 use autonomi::client::payment::Receipt;
 use autonomi::XorName;
 use std::collections::HashSet;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ReceiptError {
+    #[error("Cannot merge empty receipt list")]
+    EmptyReceiptList,
+}
 
 #[derive(Debug, Clone)]
 pub struct ReceiptValidation {
@@ -15,8 +22,8 @@ pub fn validate_receipt_coverage_with_content_addresses(
     // Extract chunk addresses covered by the receipt
     let covered_chunks = extract_covered_chunks(receipt);
 
-    println!(
-        ">>> Receipt validation: receipt covers {} chunks, quote requires {} chunks",
+    tracing::debug!(
+        "Receipt validation: receipt covers {} chunks, quote requires {} chunks",
         covered_chunks.len(),
         content_addresses.len()
     );
@@ -32,12 +39,14 @@ pub fn validate_receipt_coverage_with_content_addresses(
     }
 
     if !missing_chunks.is_empty() {
-        println!(
-            ">>> Receipt validation: {} chunks are missing from the cached receipt",
+        tracing::debug!(
+            "Receipt validation: {} chunks are missing from the cached receipt",
             missing_chunks.len()
         );
     } else {
-        println!(">>> Receipt validation: All chunks from quote are covered by cached receipt");
+        tracing::debug!(
+            "Receipt validation: All chunks from quote are covered by cached receipt"
+        );
     }
 
     ReceiptValidation {
@@ -46,16 +55,16 @@ pub fn validate_receipt_coverage_with_content_addresses(
     }
 }
 
-pub fn merge_receipts(receipts: Vec<Receipt>) -> Receipt {
+pub fn merge_receipts(receipts: Vec<Receipt>) -> Result<Receipt, ReceiptError> {
     if receipts.is_empty() {
-        panic!("Cannot merge empty receipt list");
+        return Err(ReceiptError::EmptyReceiptList);
     }
 
     if receipts.len() == 1 {
-        return receipts.into_iter().next().unwrap();
+        return Ok(receipts.into_iter().next().expect("checked len == 1"));
     }
 
-    println!(">>> Merging {} receipts", receipts.len());
+    tracing::debug!("Merging {} receipts", receipts.len());
 
     // Merge all receipts (HashMap) into one
     let mut merged_receipt = Receipt::new();
@@ -63,11 +72,7 @@ pub fn merge_receipts(receipts: Vec<Receipt>) -> Receipt {
 
     for (idx, receipt) in receipts.into_iter().enumerate() {
         let chunks_in_receipt = receipt.len();
-        println!(
-            ">>> Receipt {}: contains {} chunks",
-            idx + 1,
-            chunks_in_receipt
-        );
+        tracing::debug!("Receipt {}: contains {} chunks", idx + 1, chunks_in_receipt);
 
         // Merge all entries from this receipt
         for (xorname, payment_data) in receipt {
@@ -76,13 +81,13 @@ pub fn merge_receipts(receipts: Vec<Receipt>) -> Receipt {
         total_chunks_merged += chunks_in_receipt;
     }
 
-    println!(
-        ">>> Merged receipt contains {} unique chunks (from {} total chunks)",
+    tracing::debug!(
+        "Merged receipt contains {} unique chunks (from {} total chunks)",
         merged_receipt.len(),
         total_chunks_merged
     );
 
-    merged_receipt
+    Ok(merged_receipt)
 }
 
 fn extract_covered_chunks(receipt: &Receipt) -> HashSet<Vec<u8>> {

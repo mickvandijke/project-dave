@@ -7,7 +7,23 @@ use autonomi::vault::{
     VAULT_HEAD_DERIVATION_INDEX,
 };
 use autonomi::{Bytes, Client, GraphEntry, PublicKey, Scratchpad, ScratchpadAddress};
+use thiserror::Error;
 use tracing::info;
+
+#[derive(Debug, Error)]
+pub enum VaultKeyError {
+    #[error("Invalid vault key signature: {0}")]
+    InvalidSignature(String),
+}
+
+/// Parses a vault key from a hex-encoded signature string.
+/// Handles optional "0x" prefix.
+pub fn parse_vault_key(signature: &str) -> Result<VaultSecretKey, VaultKeyError> {
+    autonomi::client::vault::key::vault_key_from_signature_hex(
+        signature.trim_start_matches("0x"),
+    )
+    .map_err(|e| VaultKeyError::InvalidSignature(e.to_string()))
+}
 
 #[derive(Debug, Clone)]
 pub struct VaultQuoteResult {

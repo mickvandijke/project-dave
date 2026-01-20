@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::ant::client::SharedClient;
 use crate::ant::files::{File, FileAccess};
 use crate::ant::payments::{OrderID, OrderMessage, PaymentOrderManager};
-use crate::ant::vault::VaultUpdate;
+use crate::ant::vault::{parse_vault_key, VaultUpdate};
 use ant::{
     app_data::AppData,
     files::{FileFromVault, VaultStructure},
@@ -20,7 +20,7 @@ use std::collections::HashMap;
 // Removed unused rand import
 use tauri::{AppHandle, State};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 mod ant;
 pub mod logging;
@@ -347,6 +347,8 @@ async fn confirm_upload_payment(
     shared_client: State<'_, SharedClient>,
     pending_uploads: State<'_, PendingUploadsState>,
 ) -> Result<(), CommandError> {
+    use ant::receipt_processing::ReceiptProcessor;
+
     let mut pending = pending_uploads.lock().await;
 
     if let Some(upload_data) = pending.take(&upload_id) {
@@ -360,28 +362,9 @@ async fn confirm_upload_payment(
                 add_to_vault,
                 cached_receipt,
             } => {
-                // Create receipt from store quote
-                let new_receipt = autonomi::client::payment::receipt_from_store_quotes(store_quote);
-
-                // Merge with cached receipt if we have one
-                let final_receipt = if let Some(cached) = cached_receipt {
-                    info!(">>> Merging new receipt with cached receipt");
-                    ant::receipt_utils::merge_receipts(vec![cached, new_receipt])
-                } else {
-                    new_receipt
-                };
-
-                // Cache the merged payment receipt
-                if let Ok(cache) = ant::files::get_payment_cache() {
-                    if let Err(e) = cache.save_payment(&file.path, &final_receipt) {
-                        error!(">>> Failed to cache payment receipt: {}", e);
-                    } else {
-                        info!(
-                            ">>> Successfully cached merged payment receipt for file: {:?}",
-                            file.path
-                        );
-                    }
-                }
+                let final_receipt =
+                    ReceiptProcessor::create_final_receipt(store_quote, cached_receipt);
+                ReceiptProcessor::cache_file_receipt(&file.path, &final_receipt);
 
                 ant::files::execute_private_single_file_upload(
                     app,
@@ -408,28 +391,9 @@ async fn confirm_upload_payment(
                 vault_secret_key,
                 cached_receipt,
             } => {
-                // Create receipt from store quote
-                let new_receipt = autonomi::client::payment::receipt_from_store_quotes(store_quote);
-
-                // Merge with cached receipt if we have one
-                let final_receipt = if let Some(cached) = cached_receipt {
-                    println!(">>> Merging new receipt with cached receipt");
-                    ant::receipt_utils::merge_receipts(vec![cached, new_receipt])
-                } else {
-                    new_receipt
-                };
-
-                // Cache the merged payment receipt
-                if let Ok(cache) = ant::files::get_payment_cache() {
-                    if let Err(e) = cache.save_payment(&file.path, &final_receipt) {
-                        println!(">>> Failed to cache payment receipt: {}", e);
-                    } else {
-                        println!(
-                            ">>> Successfully cached merged payment receipt for file: {:?}",
-                            file.path
-                        );
-                    }
-                }
+                let final_receipt =
+                    ReceiptProcessor::create_final_receipt(store_quote, cached_receipt);
+                ReceiptProcessor::cache_file_receipt(&file.path, &final_receipt);
 
                 ant::files::execute_public_single_file_upload(
                     app,
@@ -457,30 +421,9 @@ async fn confirm_upload_payment(
                 vault_secret_key,
                 cached_receipt,
             } => {
-                // Create receipt from store quote
-                let new_receipt = autonomi::client::payment::receipt_from_store_quotes(store_quote);
-
-                // Merge with cached receipt if we have one
-                let final_receipt = if let Some(cached) = cached_receipt {
-                    println!(">>> Merging new receipt with cached receipt for archive");
-                    ant::receipt_utils::merge_receipts(vec![cached, new_receipt])
-                } else {
-                    new_receipt
-                };
-
-                // Cache the merged payment receipt
-                if let Ok(cache) = ant::files::get_payment_cache() {
-                    if let Err(e) =
-                        cache.save_archive_payment(&files, &archive_name, &final_receipt)
-                    {
-                        println!(">>> Failed to cache archive payment receipt: {}", e);
-                    } else {
-                        println!(
-                            ">>> Successfully cached merged archive payment receipt for: {}",
-                            archive_name
-                        );
-                    }
-                }
+                let final_receipt =
+                    ReceiptProcessor::create_final_receipt(store_quote, cached_receipt);
+                ReceiptProcessor::cache_archive_receipt(&files, &archive_name, &final_receipt);
 
                 ant::files::execute_public_archive_upload(
                     app,
@@ -510,30 +453,9 @@ async fn confirm_upload_payment(
                 vault_secret_key,
                 cached_receipt,
             } => {
-                // Create receipt from store quote
-                let new_receipt = autonomi::client::payment::receipt_from_store_quotes(store_quote);
-
-                // Merge with cached receipt if we have one
-                let final_receipt = if let Some(cached) = cached_receipt {
-                    println!(">>> Merging new receipt with cached receipt for archive");
-                    ant::receipt_utils::merge_receipts(vec![cached, new_receipt])
-                } else {
-                    new_receipt
-                };
-
-                // Cache the merged payment receipt
-                if let Ok(cache) = ant::files::get_payment_cache() {
-                    if let Err(e) =
-                        cache.save_archive_payment(&files, &archive_name, &final_receipt)
-                    {
-                        println!(">>> Failed to cache archive payment receipt: {}", e);
-                    } else {
-                        println!(
-                            ">>> Successfully cached merged archive payment receipt for: {}",
-                            archive_name
-                        );
-                    }
-                }
+                let final_receipt =
+                    ReceiptProcessor::create_final_receipt(store_quote, cached_receipt);
+                ReceiptProcessor::cache_archive_receipt(&files, &archive_name, &final_receipt);
 
                 ant::files::execute_private_archive_upload(
                     app,
@@ -571,24 +493,29 @@ async fn send_payment_order_message(
     id: OrderID,
     message: OrderMessage,
     payment_orders: State<'_, PaymentOrderManager>,
-) -> Result<(), ()> {
-    payment_orders.send_order_message(id, message).await;
-    Ok(())
+) -> Result<(), CommandError> {
+    payment_orders
+        .send_order_message(id, message)
+        .await
+        .map_err(|err| CommandError {
+            message: err.to_string(),
+        })
 }
 
 #[tauri::command]
 async fn get_vault_structure(
     vault_key_signature: String,
     shared_client: State<'_, SharedClient>,
-) -> Result<VaultStructure, ()> {
-    let secret_key = autonomi::client::vault::key::vault_key_from_signature_hex(
-        vault_key_signature.trim_start_matches("0x"),
-    )
-    .expect("Invalid vault key signature");
+) -> Result<VaultStructure, CommandError> {
+    let secret_key = parse_vault_key(&vault_key_signature).map_err(|e| CommandError {
+        message: e.to_string(),
+    })?;
 
     ant::files::get_vault_structure(&secret_key, shared_client)
         .await
-        .map_err(|_err| ()) // TODO: Map to serializable error
+        .map_err(|err| CommandError {
+            message: err.to_string(),
+        })
 }
 
 #[tauri::command]
@@ -597,30 +524,32 @@ async fn get_vault_structure_streaming(
     vault_key_signature: String,
     temp_code: String,
     shared_client: State<'_, SharedClient>,
-) -> Result<(), ()> {
-    let secret_key = autonomi::client::vault::key::vault_key_from_signature_hex(
-        vault_key_signature.trim_start_matches("0x"),
-    )
-    .expect("Invalid vault key signature");
+) -> Result<(), CommandError> {
+    let secret_key = parse_vault_key(&vault_key_signature).map_err(|e| CommandError {
+        message: e.to_string(),
+    })?;
 
     ant::files::get_vault_structure_streaming(app, &secret_key, temp_code, shared_client)
         .await
-        .map_err(|_err| ()) // TODO: Map to serializable error
+        .map_err(|err| CommandError {
+            message: err.to_string(),
+        })
 }
 
 #[tauri::command]
 async fn get_files_from_vault(
     vault_key_signature: String,
     shared_client: State<'_, SharedClient>,
-) -> Result<Vec<FileFromVault>, ()> {
-    let secret_key = autonomi::client::vault::key::vault_key_from_signature_hex(
-        vault_key_signature.trim_start_matches("0x"),
-    )
-    .expect("Invalid vault key signature");
+) -> Result<Vec<FileFromVault>, CommandError> {
+    let secret_key = parse_vault_key(&vault_key_signature).map_err(|e| CommandError {
+        message: e.to_string(),
+    })?;
 
     ant::files::get_files_from_vault(&secret_key, shared_client)
         .await
-        .map_err(|_err| ()) // TODO: Map to serializable error
+        .map_err(|err| CommandError {
+            message: err.to_string(),
+        })
 }
 
 #[tauri::command]
@@ -630,10 +559,9 @@ async fn remove_from_vault(
     archive_address: Option<String>,
     shared_client: State<'_, SharedClient>,
 ) -> Result<(), CommandError> {
-    let secret_key = autonomi::client::vault::key::vault_key_from_signature_hex(
-        vault_key_signature.trim_start_matches("0x"),
-    )
-    .expect("Invalid vault key signature");
+    let secret_key = parse_vault_key(&vault_key_signature).map_err(|e| CommandError {
+        message: e.to_string(),
+    })?;
 
     ant::files::remove_from_vault(&secret_key, &file_path, archive_address, shared_client)
         .await
@@ -649,25 +577,19 @@ async fn add_local_archive_to_vault(
     archive_name: String,
     shared_client: State<'_, SharedClient>,
 ) -> Result<(), CommandError> {
-    eprintln!("=== add_local_archive_to_vault COMMAND ===");
-    eprintln!("vault_key_signature: {}", vault_key_signature);
-    eprintln!("archive_access: {:?}", archive_access);
-    eprintln!("archive_name: {}", archive_name);
+    debug!(
+        archive_name = %archive_name,
+        archive_access = ?archive_access,
+        "add_local_archive_to_vault command"
+    );
 
-    let secret_key = match autonomi::client::vault::key::vault_key_from_signature_hex(
-        vault_key_signature.trim_start_matches("0x"),
-    ) {
-        Ok(key) => {
-            eprintln!("Successfully parsed vault key");
-            key
+    let secret_key = parse_vault_key(&vault_key_signature).map_err(|e| {
+        error!("Failed to parse vault key: {:?}", e);
+        CommandError {
+            message: e.to_string(),
         }
-        Err(e) => {
-            eprintln!("Failed to parse vault key: {:?}", e);
-            return Err(CommandError {
-                message: format!("Invalid vault key signature: {:?}", e),
-            });
-        }
-    };
+    })?;
+    debug!("Successfully parsed vault key");
 
     ant::files::add_local_archive_to_vault(
         &secret_key,
@@ -677,7 +599,7 @@ async fn add_local_archive_to_vault(
     )
     .await
     .map_err(|err| {
-        eprintln!("add_local_archive_to_vault failed with error: {:?}", err);
+        error!("add_local_archive_to_vault failed: {:?}", err);
         CommandError {
             message: err.to_string(),
         }
@@ -691,30 +613,24 @@ async fn add_local_file_to_vault(
     file_name: String,
     shared_client: State<'_, SharedClient>,
 ) -> Result<(), CommandError> {
-    eprintln!("=== add_local_file_to_vault COMMAND ===");
-    eprintln!("vault_key_signature: {}", vault_key_signature);
-    eprintln!("file_access: {:?}", file_access);
-    eprintln!("file_name: {}", file_name);
+    debug!(
+        file_name = %file_name,
+        file_access = ?file_access,
+        "add_local_file_to_vault command"
+    );
 
-    let secret_key = match autonomi::client::vault::key::vault_key_from_signature_hex(
-        vault_key_signature.trim_start_matches("0x"),
-    ) {
-        Ok(key) => {
-            eprintln!("Successfully parsed vault key");
-            key
+    let secret_key = parse_vault_key(&vault_key_signature).map_err(|e| {
+        error!("Failed to parse vault key: {:?}", e);
+        CommandError {
+            message: e.to_string(),
         }
-        Err(e) => {
-            eprintln!("Failed to parse vault key: {:?}", e);
-            return Err(CommandError {
-                message: format!("Invalid vault key signature: {:?}", e),
-            });
-        }
-    };
+    })?;
+    debug!("Successfully parsed vault key");
 
     ant::files::add_local_file_to_vault(&secret_key, file_access, &file_name, shared_client)
         .await
         .map_err(|err| {
-            eprintln!("add_local_file_to_vault failed with error: {:?}", err);
+            error!("add_local_file_to_vault failed: {:?}", err);
             CommandError {
                 message: err.to_string(),
             }
@@ -728,25 +644,19 @@ async fn add_to_vault_with_analysis(
     file_name: String,
     shared_client: State<'_, SharedClient>,
 ) -> Result<(), CommandError> {
-    eprintln!("=== add_to_vault_with_analysis COMMAND ===");
-    eprintln!("vault_key_signature: {}", vault_key_signature);
-    eprintln!("file_access: {:?}", file_access);
-    eprintln!("file_name: {}", file_name);
+    debug!(
+        file_name = %file_name,
+        file_access = ?file_access,
+        "add_to_vault_with_analysis command"
+    );
 
-    let secret_key = match autonomi::client::vault::key::vault_key_from_signature_hex(
-        vault_key_signature.trim_start_matches("0x"),
-    ) {
-        Ok(key) => {
-            eprintln!("Successfully parsed vault key");
-            key
+    let secret_key = parse_vault_key(&vault_key_signature).map_err(|e| {
+        error!("Failed to parse vault key: {:?}", e);
+        CommandError {
+            message: e.to_string(),
         }
-        Err(e) => {
-            eprintln!("Failed to parse vault key: {:?}", e);
-            return Err(CommandError {
-                message: format!("Invalid vault key signature: {:?}", e),
-            });
-        }
-    };
+    })?;
+    debug!("Successfully parsed vault key");
 
     let client = shared_client
         .get_client()
@@ -762,7 +672,7 @@ async fn add_to_vault_with_analysis(
 
             match client.analyze_address(&hex_addr, false).await {
                 Ok(autonomi::client::analyze::Analysis::PublicArchive { .. }) => {
-                    eprintln!("Detected public archive, adding as archive");
+                    debug!("Detected public archive, adding as archive");
                     ant::files::add_local_archive_to_vault(
                         &secret_key,
                         FileAccess::Public(*addr),
@@ -772,7 +682,7 @@ async fn add_to_vault_with_analysis(
                     .await
                 }
                 _ => {
-                    eprintln!("Detected public file, adding as file");
+                    debug!("Detected public file, adding as file");
                     ant::files::add_local_file_to_vault(
                         &secret_key,
                         file_access,
@@ -788,7 +698,7 @@ async fn add_to_vault_with_analysis(
 
             match client.analyze_address(&hex_addr, true).await {
                 Ok(autonomi::client::analyze::Analysis::PrivateArchive { .. }) => {
-                    eprintln!("Detected private archive, adding as archive");
+                    debug!("Detected private archive, adding as archive");
                     ant::files::add_local_archive_to_vault(
                         &secret_key,
                         FileAccess::Private(data_map.clone()),
@@ -798,7 +708,7 @@ async fn add_to_vault_with_analysis(
                     .await
                 }
                 _ => {
-                    eprintln!("Detected private file, adding as file");
+                    debug!("Detected private file, adding as file");
                     ant::files::add_local_file_to_vault(
                         &secret_key,
                         file_access,
@@ -812,7 +722,7 @@ async fn add_to_vault_with_analysis(
     };
 
     result.map_err(|err| {
-        eprintln!("add_to_vault_with_analysis failed with error: {:?}", err);
+        error!("add_to_vault_with_analysis failed: {:?}", err);
         CommandError {
             message: err.to_string(),
         }
@@ -860,9 +770,13 @@ async fn get_single_file_data(
 async fn confirm_payment(
     order_id: u64,
     payment_orders: State<'_, PaymentOrderManager>,
-) -> Result<(), ()> {
-    payment_orders.confirm_payment(order_id as u16).await;
-    Ok(())
+) -> Result<(), CommandError> {
+    payment_orders
+        .confirm_payment(order_id as u16)
+        .await
+        .map_err(|err| CommandError {
+            message: err.to_string(),
+        })
 }
 
 #[tauri::command]
@@ -1044,7 +958,7 @@ async fn get_unique_download_path(downloads_path: String, filename: String) -> R
         .unwrap_or_default();
 
     // Try numbered variants until we find one that doesn't exist
-    for i in 1..1000 {
+    for i in 1..ant::constants::MAX_FILENAME_VARIANTS {
         let new_filename = format!("{} ({}){}", stem, i, extension);
         let new_path = base_path.join(&new_filename);
         if !new_path.exists() {

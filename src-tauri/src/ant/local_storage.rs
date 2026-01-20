@@ -11,6 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, State};
 use thiserror::Error as ThisError;
+use tracing::error;
 
 #[derive(ThisError, Debug)]
 pub enum LocalStorageError {
@@ -518,7 +519,7 @@ pub async fn get_local_structure_streaming(
                         let _ = app.emit("local-update", update);
                     }
                     Err(err) => {
-                        println!(">>> Failed to get private archive: {:?}", err);
+                        error!("Failed to get private archive: {:?}", err);
                         let failed_archive = LocalFailedArchive {
                             name: archive_name.clone(),
                             file_access: FileAccess::Private(data_map_chunk),
