@@ -1,158 +1,63 @@
 <script lang="ts" setup>
-import {ref, onMounted} from 'vue';
-import {invoke} from '@tauri-apps/api/core';
-import {open} from '@tauri-apps/plugin-dialog';
-import {useToast} from 'primevue/usetoast';
+import { onMounted } from 'vue';
+import { useSettings } from '~/composables/useSettings';
+import { useNotifications } from '~/composables/useNotifications';
 
-const toast = useToast();
+const settings = useSettings();
+const { showSuccess, showError } = useNotifications();
 
-// State
-const downloadDirectory = ref<string>('');
-const isLoading = ref(false);
-const isSaving = ref(false);
-const appVersion = ref<string>('');
-const usePaymaster = ref<boolean>(false);
+// Destructure for template convenience
+const { downloadPath, usePaymaster, appVersion, isLoading, isSaving } = settings;
 
 // Load current settings
 const loadSettings = async () => {
   try {
-    isLoading.value = true;
-    const appData = await invoke('app_data') as any;
-    downloadDirectory.value = appData.download_path || '';
-    usePaymaster.value = appData.use_paymaster ?? false;
+    await settings.loadSettings();
   } catch (error) {
-    console.error('Failed to load settings:', error);
-    toast.add({
-      severity: 'error',
-      summary: 'Error',
-      detail: 'Failed to load settings',
-      life: 3000
-    });
-  } finally {
-    isLoading.value = false;
+    showError('Error', 'Failed to load settings');
   }
 };
 
 // Choose directory and auto-save
 const chooseDirectory = async () => {
   try {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: 'Choose Download Directory'
-    });
-
-    if (selected && selected !== downloadDirectory.value) {
-      const previousValue = downloadDirectory.value;
-      downloadDirectory.value = selected as string;
-
-      // Auto-save the new directory
-      try {
-        isSaving.value = true;
-        const currentAppData = await invoke('app_data') as any;
-        const updatedAppData = {
-          ...currentAppData,
-          download_path: downloadDirectory.value
-        };
-
-        await invoke('app_data_store', {
-          appData: updatedAppData
-        });
-
-
-        toast.add({
-          severity: 'success',
-          summary: 'Success',
-          detail: 'Download directory updated',
-          life: 3000
-        });
-      } catch (saveError) {
-        // Revert on error
-        downloadDirectory.value = previousValue;
-        console.error('Failed to save directory:', saveError);
-        toast.add({
-          severity: 'error',
-          summary: 'Error',
-          detail: 'Failed to save download directory',
-          life: 3000
-        });
-      } finally {
-        isSaving.value = false;
-      }
+    const selected = await settings.chooseDownloadDirectory();
+    if (selected) {
+      showSuccess('Success', 'Download directory updated');
     }
   } catch (error) {
-    console.error('Failed to select directory:', error);
-    toast.add({
-      severity: 'error',
-      summary: 'Error',
-      detail: 'Failed to select directory',
-      life: 3000
-    });
+    showError('Error', 'Failed to save download directory');
   }
 };
 
 // Open logs folder
 const openLogsFolder = async () => {
   try {
-    const logsPath = await invoke('get_logs_directory');
-    await invoke('show_item_in_file_manager', {path: logsPath});
+    await settings.openLogsFolder();
   } catch (error) {
-    console.error('Failed to open logs folder:', error);
-    toast.add({
-      severity: 'error',
-      summary: 'Error',
-      detail: 'Failed to open logs folder',
-      life: 3000
-    });
+    showError('Error', 'Failed to open logs folder');
   }
 };
 
 // Auto-save paymaster settings when toggled
 const onPaymasterToggle = async () => {
-  const previousValue = !usePaymaster.value; // Store the opposite of current value
-
   try {
-    isSaving.value = true;
-    const currentAppData = await invoke('app_data') as any;
-    const updatedAppData = {
-      ...currentAppData,
-      use_paymaster: usePaymaster.value
-    };
-
-    await invoke('app_data_store', {
-      appData: updatedAppData
-    });
-
-    toast.add({
-      severity: 'success',
-      summary: 'Success',
-      detail: usePaymaster.value
+    await settings.setUsePaymaster(!usePaymaster.value);
+    showSuccess(
+      'Success',
+      usePaymaster.value
         ? 'Paymaster enabled - gas-free transactions active'
-        : 'Paymaster disabled - standard payments active',
-      life: 3000
-    });
+        : 'Paymaster disabled - standard payments active'
+    );
   } catch (error) {
-    // Revert on error
-    usePaymaster.value = previousValue;
-    console.error('Failed to save paymaster settings:', error);
-    toast.add({
-      severity: 'error',
-      summary: 'Error',
-      detail: 'Failed to update paymaster settings',
-      life: 3000
-    });
-  } finally {
-    isSaving.value = false;
+    showError('Error', 'Failed to update paymaster settings');
   }
 };
 
-
 onMounted(async () => {
   loadSettings();
-
-  // Get app version
   try {
-    appVersion.value = await invoke('get_app_version');
+    await settings.loadAppVersion();
   } catch (error) {
     console.error('Failed to get app version:', error);
   }
@@ -186,7 +91,7 @@ onMounted(async () => {
           <div class="flex gap-3 items-center">
             <div class="flex-1">
               <InputText
-                  v-model="downloadDirectory"
+                  :model-value="downloadPath"
                   :disabled="true"
                   placeholder="No directory selected"
                   class="w-full"
@@ -203,9 +108,9 @@ onMounted(async () => {
             </CommonButton>
           </div>
 
-          <div v-if="downloadDirectory" class="mt-2">
+          <div v-if="downloadPath" class="mt-2">
             <p class="text-sm text-autonomi-text-secondary dark:text-autonomi-text-secondary-dark">
-              Current: {{ downloadDirectory }}
+              Current: {{ downloadPath }}
             </p>
           </div>
         </div>
@@ -221,7 +126,7 @@ onMounted(async () => {
 
           <div class="flex items-center gap-3">
             <Checkbox
-              v-model="usePaymaster"
+              :model-value="usePaymaster"
               inputId="usePaymaster"
               binary
               @change="onPaymasterToggle"

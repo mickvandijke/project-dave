@@ -1,16 +1,14 @@
 <script lang="ts" setup>
 import {ref, computed} from "vue";
 import {invoke} from "@tauri-apps/api/core";
-import {useToast} from "primevue/usetoast";
 import {useWalletStore} from "~/stores/wallet";
 import {storeToRefs} from "pinia";
 import { detectHexType, cleanHex, hexToBytes } from "~/utils/hex";
 import { useNotifications } from "~/composables/useNotifications";
+import { useDialogNotification } from "~/stores/notifications";
 
-const emit = defineEmits(["show-notify", "hide-notify"]);
-
-const toast = useToast();
 const { showSuccess, showError, showInfo } = useNotifications();
+const dialogNotification = useDialogNotification();
 const walletStore = useWalletStore();
 const {wallet} = storeToRefs(walletStore);
 
@@ -40,12 +38,7 @@ const downloadFile = async () => {
     const downloadPath = appData.download_path || "";
 
     if (!downloadPath) {
-      toast.add({
-        severity: "error",
-        summary: "Error",
-        detail: "Please set download directory in settings first",
-        life: 5000
-      });
+      showError("Error", "Please set download directory in settings first", 5000);
       return;
     }
 
@@ -56,12 +49,7 @@ const downloadFile = async () => {
     }) as string;
 
     // Show download started notification
-    toast.add({
-      severity: "info",
-      summary: "Download Started",
-      detail: `Downloading ${fileName}...`,
-      life: 3000
-    });
+    showInfo("Download Started", `Downloading ${fileName}...`);
 
     if (inputType.value === "address") {
       const address = cleanHex(inputValue.value);
@@ -86,20 +74,10 @@ const downloadFile = async () => {
       originalInput: inputValue.value.trim()
     };
 
-    toast.add({
-      severity: "success",
-      summary: "Success",
-      detail: "Download completed successfully",
-      life: 3000
-    });
+    showSuccess("Success", "Download completed successfully");
   } catch (error) {
     console.error("Download error:", error);
-    toast.add({
-      severity: "error",
-      summary: "Download Failed",
-      detail: error instanceof Error ? error.message : "Failed to download file",
-      life: 5000
-    });
+    showError("Download Failed", error instanceof Error ? error.message : "Failed to download file", 5000);
   } finally {
     isDownloading.value = false;
   }
@@ -114,12 +92,7 @@ const showInFolder = async () => {
     });
   } catch (error) {
     console.error("Failed to show file:", error);
-    toast.add({
-      severity: "error",
-      summary: "Error",
-      detail: "Failed to show file in folder",
-      life: 3000
-    });
+    showError("Error", "Failed to show file in folder");
   }
 };
 
@@ -136,11 +109,10 @@ const addDirectlyToVault = async () => {
     const fileName = getFileName();
 
     // Show notification that we're adding the file
-    emit('show-notify', {
-      notifyType: 'info',
+    dialogNotification.show({
       title: 'Adding file to vault',
       details: `Adding "${fileName}" to your vault...`,
-      enabledCancel: false
+      canCancel: false
     });
 
     // Determine the file access type using hex utilities
@@ -159,14 +131,9 @@ const addDirectlyToVault = async () => {
     });
 
     // Hide the notification
-    emit('hide-notify');
+    dialogNotification.hide();
 
-    toast.add({
-      severity: "success",
-      summary: "Added to Vault",
-      detail: `"${fileName}" has been added to your vault.`,
-      life: 3000
-    });
+    showSuccess("Added to Vault", `"${fileName}" has been added to your vault.`);
 
     // Reset after successful vault addition
     reset();
@@ -175,14 +142,9 @@ const addDirectlyToVault = async () => {
     console.error("Failed to add to vault:", error);
 
     // Hide the notification on error too
-    emit('hide-notify');
+    dialogNotification.hide();
 
-    toast.add({
-      severity: "error",
-      summary: "Failed to add to vault",
-      detail: error instanceof Error ? error.message : "Failed to add to vault",
-      life: 5000
-    });
+    showError("Failed to add to vault", error instanceof Error ? error.message : "Failed to add to vault", 5000);
   } finally {
     isAddingToVault.value = false;
   }

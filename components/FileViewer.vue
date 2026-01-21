@@ -13,7 +13,10 @@ import {invoke} from '@tauri-apps/api/core';
 import {downloadDir} from '@tauri-apps/api/path';
 import {open} from '@tauri-apps/plugin-dialog';
 import {basename} from '@tauri-apps/api/path';
-// Remove direct plugin import - we'll use the backend command instead
+import {formatBytes} from '~/utils/formatting';
+import {useNotifications} from '~/composables/useNotifications';
+import { FileBreadcrumbs, FileList, FileGrid } from '~/components/files';
+import UploadOptionsDialog from '~/components/upload/UploadOptionsDialog.vue';
 
 const toast = useToast();
 const confirm = useConfirm();
@@ -153,7 +156,6 @@ const handleCancelUploadModal = async () => {
 };
 
 const initiatePaymentForUpload = (uploadId: string) => {
-  console.log(">>> Initiating payment for upload:", uploadId);
 
   // Check if there's already a modal open
   if (showUploadModal.value) {
@@ -203,7 +205,6 @@ const initiatePaymentForUpload = (uploadId: string) => {
   // Show the payment modal
   showUploadModal.value = true;
 
-  console.log(">>> Payment modal opened for upload:", uploadId);
 };
 
 const handleCloseUploadModal = () => {
@@ -214,14 +215,11 @@ const handleCloseUploadModal = () => {
   const modalUpload = modalUploadId.value ? uploadsStore.uploads.find(u => u.id === modalUploadId.value) : null;
   const uploadInProgress = modalUpload && ['uploading'].includes(modalUpload.status);
 
-  console.log(">>> handleCloseUploadModal - hasActiveProcessing:", hasActiveProcessing, "uploadInProgress:", uploadInProgress, "modalUpload status:", modalUpload?.status);
 
   // Always allow modal to close, but only cancel upload if it's not in progress
   if (!hasActiveProcessing && !uploadInProgress) {
-    console.log(">>> Modal closing - cancelling upload since it's not in progress");
     handleCancelUploadModal();
   } else {
-    console.log(">>> Modal closing - keeping upload alive since it's in progress");
     // Just close the modal without cancelling the upload
     showUploadModal.value = false;
     // Clean up modal state but keep upload running
@@ -235,29 +233,23 @@ const handleCloseUploadModal = () => {
 };
 
 const handlePayUpload = async () => {
-  console.log(">>> handlePayUpload called with quoteData:", quoteData.value);
-  console.log(">>> payments array:", quoteData.value?.payments);
-  console.log(">>> payment_required:", quoteData.value?.payment_required);
 
   if (!quoteData.value?.payments || quoteData.value.payments.length === 0) {
     console.error("No payments data available - might be free upload");
 
     // If it's a free upload (no payments required), proceed directly
     if (quoteData.value?.paymentRequired === false) {
-      console.log(">>> Free upload detected, proceeding without payment");
 
       // Update UI to show no payment needed
       updateStepStatus('payment-request', 'completed', 'No payment required');
 
       // Free upload - complete instantly
       if (modalUploadId.value) {
-        console.log(">>> Free upload in payment modal - marking as completed instantly");
 
         // Determine completion message based on cost
         let completionMessage = 'Upload completed';
         if (quoteData.value?.totalCostNano === '0' || quoteData.value?.totalCostNano === 0) {
           completionMessage = 'Already uploaded';
-          console.log(">>> Duplicate upload detected in payment modal (cost = 0) - using 'already uploaded' message");
         }
 
         // Mark upload as completed immediately
@@ -290,9 +282,6 @@ const handlePayUpload = async () => {
   }
 
   try {
-    console.log(">>> Processing payment for quote:", quoteData.value);
-    console.log(">>> Wallet store state - checking wallet connection...");
-    console.log(">>> Payments to process:", quoteData.value.payments);
 
     // The wallet connection check will happen inside payForQuotes method
     // If wallet is not connected, it should throw an error there
@@ -308,13 +297,10 @@ const handlePayUpload = async () => {
     });
 
     // Process payment through wallet
-    console.log(">>> Calling walletStore.payForQuotes...");
 
     // Use rawPayments if available, otherwise fall back to payments
     const quotes = quoteData.value.rawPayments;
     const txHashes = await walletStore.payForQuotes(quotes);
-    console.log(">>> walletStore.payForQuotes completed successfully:", txHashes);
-    console.log(">>> Payment successful, transaction hashes:", txHashes);
 
     // Hide wallet payment notification
     emit("hide-notify");
@@ -322,7 +308,6 @@ const handlePayUpload = async () => {
     // Update UI to show wallet payment successful
     updateStepStatus('payment-request', 'completed', 'Payment confirmed');
 
-    console.log(">>> FILEVIEWER PAYMENT COMPLETED - notifying backend to proceed");
 
     // Confirm payment with backend to trigger upload execution
     if (modalUploadId.value) {
@@ -330,7 +315,6 @@ const handlePayUpload = async () => {
         await invoke("confirm_upload_payment", {
           uploadId: modalUploadId.value // Use the same ID throughout!
         });
-        console.log(">>> Backend notified of payment confirmation");
       } catch (error) {
         console.error("Failed to confirm payment with backend:", error);
         updateStepStatus('payment-request', 'error', 'Failed to start upload');
@@ -340,17 +324,12 @@ const handlePayUpload = async () => {
 
     // Don't manually update upload status - wait for backend Started/Uploading events
     if (modalUploadId.value) {
-      console.log(">>> PAYMENT COMPLETE - Waiting for backend to start upload:", modalUploadId.value);
     }
 
     // The upload will proceed automatically since payment is confirmed
     // Close modal after successful payment
-    console.log(">>> PAYMENT COMPLETE - Closing modal, switching to uploads tab");
-    console.log(">>> showUploadModal.value before:", showUploadModal.value);
     showUploadModal.value = false;
-    console.log(">>> showUploadModal.value after:", showUploadModal.value);
     activeTab.value = 2; // Switch to uploads tab
-    console.log(">>> Current active tab:", activeTab.value);
 
     // Clean up modal state
     pendingUploadFiles.value = null;
@@ -407,6 +386,12 @@ const handleFileNameClick = (file: any) => {
     selectedFileItem.value = file;
     isVisibleFileInfo.value = true;
   }
+};
+
+// Handler for file menu click from FileList/FileGrid components
+const handleFileMenuClick = (event: MouseEvent, file: any) => {
+  selectedFileItem.value = file;
+  refFilesMenu.value.toggle(event);
 };
 
 // Menu definitions
@@ -718,15 +703,12 @@ const menuDownloads = computed(() => {
         if (selectedDownloadItem.value) {
           // Remove the failed download entry and start a new download
           const failedDownload = selectedDownloadItem.value;
-          console.log('>>> Retry download - failedDownload:', failedDownload);
 
           downloadsStore.removeDownload(failedDownload.id);
           // Use the stored file object to retry download
           if (failedDownload.fileObject) {
-            console.log('>>> Retry download - calling handleDownloadFile with stored fileObject');
             handleDownloadFile(failedDownload.fileObject);
           } else {
-            console.log('>>> Retry download - no fileObject stored in failed download');
           }
         }
       },
@@ -850,6 +832,7 @@ const combinedFiles = computed(() => {
           is_private: isPrivate,
           is_loaded: false,
           is_loading: false,
+          is_directory: false,
           load_error: true,
           path: `failed-archive://${archiveAddress}`,
           address: archiveAddress,
@@ -870,6 +853,7 @@ const combinedFiles = computed(() => {
           is_private: isPrivate,
           is_loaded: false,
           is_loading: true,
+          is_directory: false,
           load_error: false,
           path: `loading-archive://${archiveAddress}`,
           address: archiveAddress,
@@ -879,8 +863,10 @@ const combinedFiles = computed(() => {
 
   return [...regularFiles, ...failedArchiveFiles, ...loadingArchiveFiles].sort((a, b) => {
     // Sort by name, putting directories first, then files
-    if (a.is_directory !== b.is_directory) {
-      return a.is_directory ? -1 : 1;
+    const aIsDir = 'is_directory' in a ? a.is_directory : false;
+    const bIsDir = 'is_directory' in b ? b.is_directory : false;
+    if (aIsDir !== bIsDir) {
+      return aIsDir ? -1 : 1;
     }
     return a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'});
   });
@@ -938,12 +924,13 @@ const openFolderPickerAndUploadFiles = async () => {
 };
 
 // Upload options modal handlers
-const handleConfirmUploadOptions = async () => {
+const handleConfirmUploadOptions = async (options: typeof uploadOptionsData.value) => {
   showUploadOptionsModal.value = false;
 
-  const {files, isFolder, isPrivate, addToVault, useCachedReceipts} = uploadOptionsData.value;
+  const {files, isFolder, isPrivate, addToVault, useCachedReceipts} = options;
 
-  // All upload options are now fully supported!
+  // Update local state with confirmed options
+  uploadOptionsData.value = options;
 
   await uploadFiles(files, isFolder, isPrivate, addToVault, useCachedReceipts);
 };
@@ -972,13 +959,9 @@ const uploadFiles = async (files: Array<{
 
     // Create upload entry in the store (but keep it pending until payment)
     const frontendUploadId = uploadsStore.createUpload(files, addToVault);
-    console.log(">>> Created upload with ID:", frontendUploadId);
-    console.log(">>> Upload in store:", uploadsStore.uploads.find(u => u.id === frontendUploadId));
-    console.log(">>> Active uploads after creation:", uploadsStore.activeUploads.length);
 
     // Check if another upload modal is already open
     if (showUploadModal.value && modalUploadId.value) {
-      console.log(">>> Another upload modal is already open. Upload created but will proceed without modal UI.");
       // The upload will proceed in the background and get processed when it receives the quote event
       // This allows multiple uploads to be started even if one modal is open
     } else {
@@ -992,7 +975,6 @@ const uploadFiles = async (files: Array<{
     }
 
     // Start by getting the quote only - no actual upload yet
-    console.log(">>> FILEVIEWER STARTING UPLOAD WITH NEW SYSTEM");
 
     // Update step to show quoting in progress
     updateStepStatus('quoting', 'processing', 'Getting storage cost estimate... This might take a while.');
@@ -1018,7 +1000,6 @@ const uploadFiles = async (files: Array<{
       useCachedReceipts, // Use cached receipt option
     });
 
-    console.log(">>> Upload started with ID:", frontendUploadId);
 
     // The upload-quote event will be emitted by the backend and handled by the event listener
 
@@ -1199,8 +1180,8 @@ const handleCopyUploadDataAddress = async (upload: any) => {
   try {
     let dataAddress = '';
 
-    if (upload.fileAccess?.Public) {
-      dataAddress = upload.fileAccess.Public;
+    if (upload.file_access?.Public) {
+      dataAddress = upload.file_access.Public;
     }
 
     if (dataAddress) {
@@ -1234,16 +1215,16 @@ const handleCopyUploadDataMap = async (upload: any) => {
   try {
     let dataMap = '';
 
-    if (upload.fileAccess?.Private) {
+    if (upload.file_access?.Private) {
       // Convert to hex string if it's an array (similar to existing pattern)
-      if (Array.isArray(upload.fileAccess.Private)) {
-        dataMap = upload.fileAccess.Private.map((byte: number) =>
+      if (Array.isArray(upload.file_access.Private)) {
+        dataMap = upload.file_access.Private.map((byte: number) =>
             byte.toString(16).padStart(2, '0')
         ).join('');
       } else {
-        dataMap = upload.fileAccess.Private.startsWith('0x')
-            ? upload.fileAccess.Private.slice(2)
-            : upload.fileAccess.Private;
+        dataMap = upload.file_access.Private.startsWith('0x')
+            ? upload.file_access.Private.slice(2)
+            : upload.file_access.Private;
       }
     }
 
@@ -1421,8 +1402,6 @@ const handleAddToVault = async (file: any) => {
               }
             }
 
-            console.log('>>> Adding file to vault:', file);
-            console.log('File access:', fileAccess);
 
             if (!fileAccess) {
               throw new Error('File access not found');
@@ -1504,20 +1483,9 @@ const handleAddToVault = async (file: any) => {
             archiveAccess = file.archive_access;
           }
 
-          // Debug logging
-          console.log('File object:', file);
-          console.log('Archive data:', file.archive);
-          console.log('Archive access:', archiveAccess);
-
           if (!archiveAccess) {
             throw new Error('Archive access not found');
           }
-
-          console.log('Calling add_local_archive_to_vault with:', {
-            vaultKeySignature,
-            archiveAccess,
-            archiveName: fileName
-          });
 
           // Show notification that we're adding the archive
           emit('show-notify', {
@@ -1573,7 +1541,6 @@ const handleAddToVault = async (file: any) => {
 };
 
 const handleDeleteLocalFile = async (file: any) => {
-  console.log("FILE: ", file);
 
   try {
     const fileName = file.name;
@@ -1750,29 +1717,23 @@ const handleDownloadFile = async (fileToDownload?: any) => {
       // Get custom download path from settings, fallback to default
       const appData = await invoke('app_data') as any;
       const downloadsPath = appData.download_path || await downloadDir();
-      console.log('Downloads path:', downloadsPath);
       const uniquePath = await invoke('get_unique_download_path', {
         downloadsPath,
         filename: fileName
       }) as string;
-      console.log('Unique path:', uniquePath);
 
-      console.log('Download fileData.file_access:', fileData.file_access);
 
       if (!fileData.file_access) {
         throw new Error('No file access data available for download');
       }
 
-      console.log('Downloading file with access:', fileData.file_access);
 
       if (fileData.file_access.Private) {
-        console.log('Downloading private file with data_map_chunk:', fileData.file_access.Private);
         await invoke('download_private_file', {
           dataMapChunk: fileData.file_access.Private,
           toDest: uniquePath,
         });
       } else if (fileData.file_access.Public) {
-        console.log('Downloading public file with addr:', fileData.file_access.Public);
         // Public file_access now contains the data address string directly
         await invoke('download_public_file', {
           addr: fileData.file_access.Public,
@@ -1792,7 +1753,6 @@ const handleDownloadFile = async (fileToDownload?: any) => {
       const finalFileName = uniquePath.split('/').pop() || fileName;
 
       // Show a toast notification with action button
-      console.log('>>> Adding download success toast for:', finalFileName, 'at path:', uniquePath);
 
       toast.add({
         severity: 'success',
@@ -1820,7 +1780,6 @@ const handleDownloadFile = async (fileToDownload?: any) => {
       });
     }
   } catch (error: any) {
-    console.log('>>> Error in FileViewer.vue >> handleDownloadFile: ', error);
   }
 };
 
@@ -1863,25 +1822,20 @@ const handleDownloadArchive = async (archiveToDownload?: any) => {
       // Get custom download path from settings, fallback to default
       const appData = await invoke('app_data') as any;
       const downloadsPath = appData.download_path || await downloadDir();
-      console.log('Archive downloads path:', downloadsPath);
 
       // Create a unique folder name for the archive
       const uniquePath = await invoke('get_unique_download_path', {
         downloadsPath,
         filename: archiveName
       }) as string;
-      console.log('Unique archive path:', uniquePath);
 
-      console.log('Downloading archive with access:', archiveAccess);
 
       if (archiveAccess.Private) {
-        console.log('Downloading private archive with data_map_chunk:', archiveAccess.Private);
         await invoke('download_private_file', {
           dataMapChunk: archiveAccess.Private,
           toDest: uniquePath,
         });
       } else if (archiveAccess.Public) {
-        console.log('Downloading public archive with addr:', archiveAccess.Public);
         await invoke('download_public_file', {
           addr: archiveAccess.Public,
           toDest: uniquePath,
@@ -1900,7 +1854,6 @@ const handleDownloadArchive = async (archiveToDownload?: any) => {
       const finalArchiveName = uniquePath.split('/').pop() || archiveName;
 
       // Show a toast notification with action button
-      console.log('>>> Adding download success toast for archive:', finalArchiveName, 'at path:', uniquePath);
 
       toast.add({
         severity: 'success',
@@ -1913,7 +1866,6 @@ const handleDownloadArchive = async (archiveToDownload?: any) => {
         }
       });
     } catch (error: any) {
-      console.log('>>> Download archive error:', error);
       downloadsStore.updateDownload(downloadId, {
         status: 'failed',
         error: error.message || 'Download failed',
@@ -1927,7 +1879,6 @@ const handleDownloadArchive = async (archiveToDownload?: any) => {
       });
     }
   } catch (error: any) {
-    console.log('>>> Error in FileViewer.vue >> handleDownloadArchive: ', error);
     toast.add({
       severity: 'error',
       summary: 'Download Error',
@@ -1935,14 +1886,6 @@ const handleDownloadArchive = async (archiveToDownload?: any) => {
       life: 3000,
     });
   }
-};
-
-const formatBytes = (bytes: number): string => {
-  if (bytes === 0) return "0 Bytes";
-  const k = 1024;
-  const sizes = ["Bytes", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
 };
 
 const formatUploadDuration = (startTime: Date, endTime?: Date): string => {
@@ -1969,7 +1912,6 @@ const secondsToDate = (seconds: number): Date => {
 
 const showInFileManager = async (filePath: string) => {
   try {
-    console.log('>>> showInFileManager called with path:', filePath);
 
     // Call the Rust backend command to reveal the file in the file manager
     await invoke('show_item_in_file_manager', {path: filePath});
@@ -1993,13 +1935,11 @@ const setupEventListeners = async () => {
 
   // Listen for vault updates from streaming
   await listen("vault-update", (event: any) => {
-    console.log(">>> Received vault-update event:", event.payload);
     fileStore.handleVaultUpdate(event.payload);
   });
 
   // Listen for local file updates from streaming
   await listen("local-update", (event: any) => {
-    console.log(">>> Received local-update event:", event.payload);
     localFilesStore.handleLocalUpdate(event.payload);
   });
 
@@ -2008,7 +1948,6 @@ const setupEventListeners = async () => {
   // Set up upload quote event listener
   await listen("upload-quote", async (event: any) => {
     const payload = event.payload;
-    console.log(">>> Upload quote received for ID:", payload.upload_id);
 
     // Find the upload by ID - much simpler since frontend and backend use same ID!
     const upload = uploadsStore.uploads.find(u => u.id === payload.upload_id);
@@ -2032,7 +1971,6 @@ const setupEventListeners = async () => {
 
     // Store quote data per upload ID
     uploadQuotes.value.set(payload.upload_id, uploadQuoteData);
-    console.log(">>> Stored quote data for upload:", payload.upload_id, uploadQuoteData);
 
     // Handle modal uploads (with UI)
     if (isModalUpload && showUploadModal.value) {
@@ -2050,7 +1988,6 @@ const setupEventListeners = async () => {
 
       // Check if this is a duplicate upload (cost = 0) first, regardless of payment_required flag
       if (payload.total_cost_nano === '0' || payload.total_cost_nano === 0) {
-        console.log(">>> Duplicate upload detected (cost = 0) - waiting for backend completion event");
         updateStepStatus('payment-request', 'completed', 'No payment required');
 
         // Don't update upload status - wait for backend Completed event
@@ -2073,7 +2010,6 @@ const setupEventListeners = async () => {
         // Don't update upload status - wait for backend events
         // The backend will handle the upload and emit appropriate events
         if (upload) {
-          console.log(">>> Free upload detected - waiting for backend to process");
 
           // Update UI to show no payment required
           updateStepStatus('quoting', 'completed', 'Quote received');
@@ -2081,14 +2017,11 @@ const setupEventListeners = async () => {
         }
       }
 
-      console.log(">>> Quote data set:", quoteData.value);
     } else if (upload) {
       // Handle non-modal uploads (background uploads)
-      console.log(">>> Processing quote for non-modal upload:", upload.id);
 
       // Check if this is a duplicate upload (cost = 0) first, regardless of payment_required flag
       if (payload.total_cost_nano === '0' || payload.total_cost_nano === 0) {
-        console.log(">>> Non-modal duplicate upload detected (cost = 0) - waiting for backend completion event");
 
         // Don't update upload status - wait for backend Completed event
         // The backend will emit a Completed event for duplicate uploads
@@ -2096,17 +2029,14 @@ const setupEventListeners = async () => {
         // Switch to uploads tab to show the upload
         activeTab.value = 2;
 
-        console.log(">>> Non-modal duplicate upload - waiting for backend");
       }
       // Set payment step based on whether payment is required
       else if (payload.payment_required && payload.payments && payload.payments.length > 0) {
-        console.log(">>> Non-modal upload requires payment - upload will wait for manual payment");
         // For now, non-modal uploads that require payment will wait
         // User will need to pay for them manually later
         // TODO: In the future, we could implement auto-payment or batch payment
       } else {
         // Free upload - wait for backend events
-        console.log(">>> Non-modal free upload detected - waiting for backend to process");
 
         // Don't update upload status - wait for backend events
         // The backend will handle the upload and emit appropriate events
@@ -2114,7 +2044,6 @@ const setupEventListeners = async () => {
         // Switch to uploads tab to show the upload
         activeTab.value = 2;
 
-        console.log(">>> Non-modal free upload - waiting for backend");
       }
     }
   });
@@ -2122,21 +2051,15 @@ const setupEventListeners = async () => {
   // Set up upload progress event listener
   await listen("upload-progress", (event: any) => {
     const payload = event.payload;
-    console.log(">>> Upload progress event:", payload.type, payload);
 
     // Get the upload ID from the payload and find the corresponding upload
-    console.log(">>> Upload progress - looking for upload_id:", payload.upload_id);
-    console.log(">>> Current uploads in store:", uploadsStore.uploads.map(u => ({id: u.id, status: u.status})));
     const upload = payload.upload_id ? uploadsStore.uploads.find(u => u.id === payload.upload_id) : null;
     const isModalUpload = upload && modalUploadId.value === upload.id;
-    console.log(">>> Found upload:", upload?.id, "isModalUpload:", isModalUpload);
 
     // Helper function to update the correct upload
     const updateUploadById = (updates: any) => {
       if (upload) {
-        console.log(">>> updateUploadById - updating upload:", upload.id, "with:", updates);
         uploadsStore.updateUpload(upload.id, updates);
-        console.log(">>> updateUploadById - upload after update:", uploadsStore.uploads.find(u => u.id === upload.id));
       } else if (payload.upload_id) {
         // Fallback: try to find by modalUploadId or create a placeholder
         console.warn(">>> updateUploadById - Upload not found for ID:", payload.upload_id);
@@ -2145,7 +2068,6 @@ const setupEventListeners = async () => {
 
         // If this is for the modal upload ID, try to update it directly
         if (modalUploadId.value === payload.upload_id) {
-          console.log(">>> Using modalUploadId as fallback");
           uploadsStore.updateUpload(modalUploadId.value, updates);
         }
       }
@@ -2244,7 +2166,6 @@ const setupEventListeners = async () => {
         break;
 
       case "Uploading":
-        console.log(">>> Uploading event - modalUploadId:", modalUploadId.value, "upload from payload:", upload?.id);
 
         // Only update the global upload store for the modal upload
         if (isModalUpload) {
@@ -2260,7 +2181,6 @@ const setupEventListeners = async () => {
           progress
         });
 
-        console.log(`>>> Updated upload with chunks: ${payload.chunks_uploaded}/${payload.total_chunks}, progress: ${progress}%`);
 
         // Only handle modal cleanup for the specific upload that the modal is open for
         if (showUploadModal.value && modalUploadId.value === upload?.id) {
@@ -2283,7 +2203,6 @@ const setupEventListeners = async () => {
         break;
 
       case "Completed":
-        console.log(">>> Upload completed event received", payload);
 
         // Only update the global upload store for the modal upload
         if (isModalUpload) {
@@ -2315,7 +2234,6 @@ const setupEventListeners = async () => {
         // Clean up stored quote data for completed upload
         if (upload?.id) {
           uploadQuotes.value.delete(upload.id);
-          console.log(">>> Cleaned up quote data for completed upload:", upload.id);
         }
 
         // Auto-refresh files after upload completion only if added to vault
@@ -2351,7 +2269,6 @@ const setupEventListeners = async () => {
         // Clean up stored quote data for failed upload
         if (upload?.id) {
           uploadQuotes.value.delete(upload.id);
-          console.log(">>> Cleaned up quote data for failed upload:", upload.id);
         }
 
         if (showUploadModal.value && isModalUpload) {
@@ -2434,13 +2351,9 @@ watch(activeTab, (newTab, oldTab) => {
 
 // Debug watcher for uploads store
 watch(() => uploadsStore.uploads, (newUploads) => {
-  console.log(">>> Uploads store changed - count:", newUploads.length);
-  console.log(">>> Active uploads count:", uploadsStore.activeUploads.length);
-  console.log(">>> Active uploads:", uploadsStore.activeUploads.map(u => ({id: u.id, status: u.status, name: u.name})));
 }, {deep: true});
 
 watch(() => uploadsStore.activeUploads.length, (newCount, oldCount) => {
-  console.log(">>> Active uploads count changed from", oldCount, "to", newCount);
 });
 
 // Watch for vault removal state to show/hide loading notification
@@ -2501,6 +2414,7 @@ const combinedLocalFiles = computed(() => {
           is_private: isPrivate,
           is_loaded: false,
           is_loading: false,
+          is_directory: false,
           load_error: true,
           path: `failed-archive://${archiveAddress}`,
           address: archiveAddress,
@@ -2521,6 +2435,7 @@ const combinedLocalFiles = computed(() => {
           is_private: isPrivate,
           is_loaded: false,
           is_loading: true,
+          is_directory: false,
           load_error: false,
           path: `loading-archive://${archiveAddress}`,
           address: archiveAddress,
@@ -2530,8 +2445,10 @@ const combinedLocalFiles = computed(() => {
 
   return [...regularFiles, ...failedArchiveFiles, ...loadingArchiveFiles].sort((a, b) => {
     // Sort by name, putting directories first, then files
-    if (a.is_directory !== b.is_directory) {
-      return a.is_directory ? -1 : 1;
+    const aIsDir = 'is_directory' in a ? a.is_directory : false;
+    const bIsDir = 'is_directory' in b ? b.is_directory : false;
+    if (aIsDir !== bIsDir) {
+      return aIsDir ? -1 : 1;
     }
     return a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'});
   });
@@ -2653,7 +2570,6 @@ const loadVault = async () => {
     showLoadVaultButton.value = false;
     await fileStore.getAllFiles();
   } catch (err) {
-    console.log('>>> Error getting files: ', err);
     // Reset state when vault loading fails (including signature cancellation)
     hasAttemptedVaultLoad.value = false;
     showLoadVaultButton.value = true;
@@ -2669,7 +2585,6 @@ const loadVault = async () => {
 watch(() => walletStore.pendingMessageSignature, (isSignaturePending, wasSignaturePending) => {
   // If signature request was cancelled (went from true to false) and we're attempting to load vault
   if (wasSignaturePending && !isSignaturePending && hasAttemptedVaultLoad.value && !walletStore.hasVaultSignature()) {
-    console.log('>>> Signature request cancelled, resetting vault loading state');
     // Reset state when signature request is cancelled
     hasAttemptedVaultLoad.value = false;
     showLoadVaultButton.value = true;
@@ -2689,7 +2604,6 @@ onMounted(async () => {
       hasAttemptedVaultLoad.value = true;
       fileStore.getAllFiles();
     } catch (err) {
-      console.log('>>> Error getting files: ', err);
       showLoadVaultButton.value = true;
     }
   } else {
@@ -2752,450 +2666,72 @@ onMounted(async () => {
         <!-- Vault Tab -->
         <TabPanel header="Vault" :value="0">
           <!-- Breadcrumbs -->
-          <div
-              v-if="breadcrumbs?.length > 0"
-              class="mx-[6rem] flex gap-4 items-center text-sm font-semibold flex-wrap my-4"
-          >
-            <div
-                class="cursor-pointer transition-all duration-300 text-autonomi-text-secondary dark:text-autonomi-text-primary-dark"
-                @click="handleClickBreadcrumb(rootDirectory)"
-            >
-              Vault
-            </div>
-            <i class="text-xs pi pi-arrow-right text-autonomi-text-primary/70 dark:text-autonomi-text-primary-dark/70"/>
+          <FileBreadcrumbs
+            :crumbs="breadcrumbs"
+            root-label="Vault"
+            :root-directory="rootDirectory"
+            @crumb-click="handleClickBreadcrumb"
+          />
 
-            <template v-for="(crumb, index) in breadcrumbs" :key="index">
-              <div
-                  :class="`cursor-pointer transition-all duration-300 ${
-                  index === breadcrumbs.length - 1
-                    ? 'text-autonomi-text-secondary dark:text-autonomi-text-secondary-dark'
-                    : 'text-autonomi-text-primary/70 dark:text-autonomi-text-primary-dark/70'
-                }`"
-                  @click="handleClickBreadcrumb(crumb)"
-              >
-                {{ crumb.name }}
-              </div>
-              <i
-                  v-if="index !== breadcrumbs.length - 1"
-                  class="text-xs pi pi-arrow-right text-autonomi-text-primary/70 dark:text-autonomi-text-primary-dark/70"
-              />
-            </template>
-          </div>
-
-          <!-- Files Table -->
-          <div
-              v-if="viewTypeVault === 'list'"
-              class="mt-6 overflow-y-auto overscroll-none"
-              style="height: calc(100vh - 280px);"
-          >
-            <div class="grid grid-cols-12 font-semibold mb-10">
-              <div
-                  class="col-span-11 pl-[6rem] text-autonomi-red-300"
-              >
-                Name
-              </div>
-              <div class="col-span-1 text-autonomi-red-300">
-                <i class="pi pi-user"/>
-              </div>
-
-              <!-- Spacer -->
-              <div class="col-span-12 h-10"/>
-
-              <!-- Files Rows -->
-              <template v-if="combinedFiles.length">
-                <div
-                    v-for="file in combinedFiles"
-                    :key="file.path || file.name"
-                    class="grid grid-cols-subgrid col-span-12 h-11 items-center odd:bg-autonomi-gray-100 dark:odd:bg-autonomi-blue-700 dark:text-autonomi-text-primary-dark"
-                    @click="!file.is_loading_archive ? handleChangeDirectory(file) : null"
-                    :class="{
-                  'cursor-pointer': (!file.path || file.is_failed_archive) && !file.is_loading_archive,
-                  'opacity-75': file.is_loading || file.is_loading_archive,
-                  'opacity-75 bg-red-100 dark:bg-red-900/20 hover:bg-red-200': file.load_error || file.is_failed_archive,
-                  'bg-blue-50 dark:bg-blue-900/20': file.is_loading_archive,
-                  'hover:bg-white dark:hover:bg-white/10': !(file.load_error || file.is_failed_archive || file.is_loading_archive)
-                }"
-                >
-                  <!-- Folder/File Name -->
-                  <div
-                      class="col-span-11 pl-[6rem] flex items-center"
-                  >
-                    <template v-if="file.is_failed_archive">
-                      <!-- This is a failed archive -->
-                      <i class="pi pi-exclamation-triangle mr-4 text-red-500"/>
-                      <i class="pi pi-box mr-2 text-red-500"/>
-                      <span class="text-ellipsis overflow-hidden whitespace-nowrap text-red-600 dark:text-red-400">
-                      {{ file.name }}
-                    </span>
-                    </template>
-                    <template v-else-if="file.is_loading_archive">
-                      <!-- This is a loading archive -->
-                      <i class="pi pi-spinner pi-spin mr-4 text-blue-500"/>
-                      <i class="pi pi-box mr-2 text-blue-500"/>
-                      <span class="text-ellipsis overflow-hidden whitespace-nowrap text-blue-600 dark:text-blue-400">
-                      {{ file.name }} (loading...)
-                    </span>
-                    </template>
-                    <template v-else-if="file?.path">
-                      <!-- This is a file -->
-                      <i
-                          v-if="/\\.(png|jpg|jpeg|gif|bmp|webp|svg)$/i.test(file.name)"
-                          class="pi pi-image mr-4"
-                      />
-                      <i
-                          v-else-if="/\\.(pdf)$/i.test(file.name)"
-                          class="pi pi-file-pdf mr-4"
-                      />
-                      <i v-else-if="/\\.(zip)$/i.test(file.name)" class="pi pi-box mr-4"/>
-                      <i v-else class="pi pi-file mr-4"/>
-
-                      <span
-                          class="text-ellipsis overflow-hidden whitespace-nowrap cursor-pointer"
-                          @click.stop="handleFileNameClick(file)">
-                      {{ file.name }}
-                    </span>
-                      <!-- Loading indicators for files -->
-                      <i v-if="file.is_loading" class="pi pi-spinner pi-spin ml-2 text-sm text-blue-500"/>
-                      <i v-else-if="file.load_error" class="pi pi-exclamation-triangle ml-2 text-sm text-red-500"
-                         v-tooltip.top="'Failed to load file data'"/>
-                    </template>
-                    <template v-else>
-                      <!-- This is a folder or archive -->
-                      <i :class="file.isArchive ? 'pi pi-box mr-4 text-amber-600 dark:text-amber-400' : 'pi pi-folder mr-4'"/>
-                      <span class="text-ellipsis overflow-hidden whitespace-nowrap">{{ file.name }}</span>
-                    </template>
-                  </div>
-
-                  <!-- Menu -->
-                  <template v-if="(file.path || file.isArchive || file.is_failed_archive) && !file.is_loading_archive">
-                    <div class="col-span-1">
-                      <i
-                          class="pi pi-ellipsis-v cursor-pointer hover:text-autonomi-gray-600  dark:hover:text-white"
-                          @click.stop="
-                        $event => {
-                          selectedFileItem = file;
-                          refFilesMenu.toggle($event);
-                        }
-                      "
-                      />
-                    </div>
-                  </template>
-                  <template v-else>
-                    <div class="col-span-1"></div>
-                  </template>
-                </div>
-              </template>
-              <template v-else>
-                <div class="col-span-12 p-8 text-center text-gray-500">
-                  <div v-if="pendingVaultStructure">
-                    <i class="pi pi-spinner pi-spin mr-4"/>Loading vault...
-                  </div>
-                  <div v-else-if="showLoadVaultButton" class="flex justify-center">
-                    <Button
-                        label="Load Vault"
-                        icon="pi pi-globe"
-                        @click="loadVault"
-                        class="mt-4"
-                    />
-                  </div>
-                  <div v-else>No files found.</div>
-                </div>
-              </template>
-            </div>
-          </div>
+          <!-- Files List View -->
+          <FileList
+            v-if="viewTypeVault === 'list'"
+            :files="combinedFiles"
+            :is-loading="pendingVaultStructure"
+            :show-load-button="showLoadVaultButton"
+            load-button-label="Load Vault"
+            @item-click="handleChangeDirectory"
+            @name-click="handleFileNameClick"
+            @menu-click="handleFileMenuClick"
+            @load-click="loadVault"
+          />
 
           <!-- Grid View -->
-          <div
-              v-else-if="viewTypeVault === 'grid'"
-              class="mt-6 overflow-y-auto overscroll-none"
-              style="height: calc(100vh - 280px);"
-          >
-            <div class="px-3 grid grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
-              <div v-if="!combinedFiles.length" class="col-span-full p-8 text-center text-gray-500">
-                <div v-if="pendingVaultStructure">
-                  <i class="pi pi-spinner pi-spin mr-4"/>Loading vault...
-                </div>
-                <div v-else-if="showLoadVaultButton" class="flex justify-center">
-                  <Button
-                      label="Load Vault"
-                      icon="pi pi-globe"
-                      @click="loadVault"
-                      class="mt-4"
-                  />
-                </div>
-                <div v-else>No files found.</div>
-              </div>
-              <template v-else>
-                <div
-                    v-for="file in combinedFiles"
-                    :key="file.path || file.name"
-                    class="aspect-square w-full text-autonomi-text-primary dark:text-autonomi-text-secondary-dark hover:bg-white rounded-lg hover:text-autonomi-text-secondary dark:hover:bg-white/10 dark:hover:text-autonomi-text-primary-dark dark:border-autonomi-blue-800 transition-all duration-500 p-3 border flex flex-col"
-                    :class="{
-                      'cursor-pointer': !file.is_loading_archive,
-                      'cursor-default opacity-75': file.is_loading_archive,
-                      'bg-blue-50 dark:bg-blue-900/20': file.is_loading_archive
-                    }"
-                    @click="!file.is_loading_archive ? handleChangeDirectory(file) : null"
-                >
-                  <template v-if="(file.path || file.isArchive || file.is_failed_archive) && !file.is_loading_archive">
-                    <!-- Menu -->
-                    <div class="self-end mb-2">
-                      <i
-                          class="pi pi-ellipsis-h cursor-pointer hover:text-autonomi-gray-600"
-                          @click.stop="
-                          $event => {
-                            selectedFileItem = file;
-                            refFilesMenu.toggle($event);
-                          }
-                        "
-                      />
-                    </div>
-                  </template>
-                  <template v-else>
-                    <div class="self-end mb-2 h-4"></div>
-                  </template>
-
-                  <div class="flex flex-col items-center justify-center flex-1 min-h-0">
-                    <div class="flex-shrink-0 mb-3">
-                      <i v-if="file.is_failed_archive" class="pi pi-exclamation-triangle text-3xl text-red-500"/>
-                      <i v-else-if="file.is_loading_archive" class="pi pi-spinner pi-spin text-3xl text-blue-500"/>
-                      <i v-else-if="file.path" class="pi pi-file text-3xl"/>
-                      <i v-else
-                         :class="file.isArchive ? 'pi pi-box text-3xl text-amber-600 dark:text-amber-400' : 'pi pi-folder text-3xl'"/>
-                    </div>
-
-                    <div class="w-full px-1 min-h-0">
-                      <span
-                          class="text-center text-xs block w-full cursor-pointer overflow-hidden text-ellipsis"
-                          style="display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word;"
-                          :title="file.is_loading_archive ? `${file.name} (loading...)` : file.name"
-                          @click.stop="file.path ? handleFileNameClick(file) : null"
-                      >
-                        {{ file.is_loading_archive ? `${file.name} (loading...)` : file.name }}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              </template>
-            </div>
-          </div>
+          <FileGrid
+            v-else-if="viewTypeVault === 'grid'"
+            :files="combinedFiles"
+            :is-loading="pendingVaultStructure"
+            :show-load-button="showLoadVaultButton"
+            load-button-label="Load Vault"
+            @item-click="handleChangeDirectory"
+            @name-click="handleFileNameClick"
+            @menu-click="handleFileMenuClick"
+            @load-click="loadVault"
+          />
         </TabPanel>
 
         <!-- Local Vault Tab -->
         <TabPanel header="Local Vault" :value="1">
 
           <!-- Local Vault Breadcrumbs -->
-          <div
-              v-if="localBreadcrumbs?.length > 0"
-              class="mx-[6rem] flex gap-4 items-center text-sm font-semibold flex-wrap my-4"
-          >
-            <div
-                class="cursor-pointer transition-all duration-300 text-autonomi-text-secondary dark:text-autonomi-text-secondary-dark"
-                @click="handleLocalBreadcrumbClick(localRootDirectory)"
-            >
-              Local Vault
-            </div>
-            <i class="text-xs pi pi-arrow-right text-autonomi-text-primary/70 dark:text-autonomi-text-primary-dark/70"/>
+          <FileBreadcrumbs
+            :crumbs="localBreadcrumbs"
+            root-label="Local Vault"
+            :root-directory="localRootDirectory"
+            @crumb-click="handleLocalBreadcrumbClick"
+          />
 
-            <template v-for="(crumb, index) in localBreadcrumbs" :key="index">
-              <div
-                  :class="`cursor-pointer transition-all duration-300 ${
-                  index === localBreadcrumbs.length - 1
-                    ? 'text-autonomi-text-secondary dark:text-autonomi-text-secondary-dark'
-                    : 'text-autonomi-text-primary/70 dark:text-autonomi-text-primary-dark/70'
-                }`"
-                  @click="handleLocalBreadcrumbClick(crumb)"
-              >
-                {{ crumb.name }}
-              </div>
-              <i
-                  v-if="index !== localBreadcrumbs.length - 1"
-                  class="text-xs pi pi-arrow-right text-autonomi-text-primary/70 dark:text-autonomi-text-primary-dark/70"
-              />
-            </template>
-          </div>
-
-          <!-- Files Table (List View) -->
-          <div
-              v-if="viewTypeVault === 'list'"
-              class="mt-6 overflow-y-auto overscroll-none"
-              style="height: calc(100vh - 280px);"
-          >
-            <div class="grid grid-cols-12 font-semibold mb-10">
-              <div
-                  class="col-span-11 pl-[6rem] text-autonomi-red-300"
-              >
-                Name
-              </div>
-              <div class="col-span-1 text-autonomi-red-300">
-                <i class="pi pi-user"/>
-              </div>
-
-              <!-- Spacer -->
-              <div class="col-span-12 h-10"/>
-
-              <!-- Files Rows -->
-              <template v-if="combinedLocalFiles.length">
-                <div
-                    v-for="file in combinedLocalFiles"
-                    :key="file.path || file.name"
-                    class="grid grid-cols-subgrid col-span-12 h-11 items-center odd:bg-autonomi-gray-100 dark:odd:bg-autonomi-blue-700 dark:text-autonomi-text-primary-dark"
-                    @click="!file.is_loading_archive ? handleLocalChangeDirectory(file) : null"
-                    :class="{
-                      'cursor-pointer': (!file.path || file.is_failed_archive) && !file.is_loading_archive,
-                      'opacity-75': file.is_loading || file.is_loading_archive,
-                      'opacity-75 bg-red-100 dark:bg-red-900/20 hover:bg-red-200': file.load_error || file.is_failed_archive,
-                      'bg-blue-50 dark:bg-blue-900/20': file.is_loading_archive,
-                      'hover:bg-white dark:hover:bg-white/10': !(file.load_error || file.is_failed_archive || file.is_loading_archive)
-                    }"
-                >
-                  <!-- Folder/File Name -->
-                  <div
-                      class="col-span-11 pl-[6rem] flex items-center"
-                  >
-                    <template v-if="file.is_failed_archive">
-                      <!-- This is a failed archive -->
-                      <i class="pi pi-exclamation-triangle mr-4 text-red-500"/>
-                      <i class="pi pi-box mr-2 text-red-500"/>
-                      <span class="text-ellipsis overflow-hidden whitespace-nowrap text-red-600 dark:text-red-400">
-                        {{ file.name }}
-                      </span>
-                    </template>
-                    <template v-else-if="file.is_loading_archive">
-                      <!-- This is a loading archive -->
-                      <i class="pi pi-spinner pi-spin mr-4 text-blue-500"/>
-                      <i class="pi pi-box mr-2 text-blue-500"/>
-                      <span class="text-ellipsis overflow-hidden whitespace-nowrap text-blue-600 dark:text-blue-400">
-                        {{ file.name }} (loading...)
-                      </span>
-                    </template>
-                    <template v-else-if="file?.path">
-                      <!-- This is a file -->
-                      <i
-                          v-if="/\\.(png|jpg|jpeg|gif|bmp|webp|svg)$/i.test(file.name)"
-                          class="pi pi-image mr-4"
-                      />
-                      <i
-                          v-else-if="/\\.(pdf)$/i.test(file.name)"
-                          class="pi pi-file-pdf mr-4"
-                      />
-                      <i v-else-if="/\\.(zip)$/i.test(file.name)" class="pi pi-box mr-4"/>
-                      <i v-else class="pi pi-file mr-4"/>
-
-                      <span
-                          class="text-ellipsis overflow-hidden whitespace-nowrap cursor-pointer"
-                          @click.stop="handleLocalFileNameClick(file)">
-                        {{ file.name }}
-                      </span>
-                      <!-- Loading indicators for files -->
-                      <i v-if="file.is_loading" class="pi pi-spinner pi-spin ml-2 text-sm text-blue-500"/>
-                      <i v-else-if="file.load_error" class="pi pi-exclamation-triangle ml-2 text-sm text-red-500"
-                         v-tooltip.top="'Failed to load file data'"/>
-                    </template>
-                    <template v-else>
-                      <!-- This is a folder or archive -->
-                      <i :class="file.isArchive ? 'pi pi-box mr-4 text-amber-600 dark:text-amber-400' : 'pi pi-folder mr-4'"/>
-                      <span class="text-ellipsis overflow-hidden whitespace-nowrap">{{ file.name }}</span>
-                    </template>
-                  </div>
-
-                  <!-- Menu -->
-                  <template v-if="(file.path || file.isArchive || file.is_failed_archive) && !file.is_loading_archive">
-                    <div class="col-span-1">
-                      <i
-                          class="pi pi-ellipsis-v cursor-pointer hover:text-autonomi-gray-600  dark:hover:text-white"
-                          @click.stop="
-                        $event => {
-                          selectedFileItem = file;
-                          refFilesMenu.toggle($event);
-                        }
-                      "
-                      />
-                    </div>
-                  </template>
-                  <template v-else>
-                    <div class="col-span-1"></div>
-                  </template>
-                </div>
-              </template>
-              <template v-else>
-                <div class="col-span-12 p-8 text-center text-gray-500">
-                  <div v-if="pendingLocalStructure">
-                    <i class="pi pi-spinner pi-spin mr-4"/>Loading local vault...
-                  </div>
-                  <div v-else>No local vault found. Files will appear here after you upload them.</div>
-                </div>
-              </template>
-            </div>
-          </div>
+          <!-- Files List View -->
+          <FileList
+            v-if="viewTypeVault === 'list'"
+            :files="combinedLocalFiles"
+            :is-loading="pendingLocalStructure"
+            :show-load-button="false"
+            @item-click="handleLocalChangeDirectory"
+            @name-click="handleLocalFileNameClick"
+            @menu-click="handleFileMenuClick"
+          />
 
           <!-- Grid View -->
-          <div
-              v-else-if="viewTypeVault === 'grid'"
-              class="mt-6 overflow-y-auto overscroll-none"
-              style="height: calc(100vh - 280px);"
-          >
-            <div class="px-3 grid grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
-              <div v-if="!combinedLocalFiles.length" class="col-span-full p-8 text-center text-gray-500">
-                <div v-if="pendingLocalStructure">
-                  <i class="pi pi-spinner pi-spin mr-4"/>Loading local vault...
-                </div>
-                <div v-else>No local vault found. Files will appear here after you upload them.</div>
-              </div>
-              <template v-else>
-                <div
-                    v-for="file in combinedLocalFiles"
-                    :key="file.path || file.name"
-                    class="aspect-square w-full text-autonomi-text-primary dark:text-autonomi-text-secondary-dark hover:bg-white rounded-lg hover:text-autonomi-text-secondary dark:hover:bg-white/10 dark:hover:text-autonomi-text-primary-dark dark:border-autonomi-blue-800 transition-all duration-500 p-3 border flex flex-col"
-                    :class="{
-                      'cursor-pointer': !file.is_loading_archive,
-                      'cursor-default opacity-75': file.is_loading_archive,
-                      'bg-blue-50 dark:bg-blue-900/20': file.is_loading_archive
-                    }"
-                    @click="!file.is_loading_archive ? handleLocalChangeDirectory(file) : null"
-                >
-                  <template v-if="(file.path || file.isArchive || file.is_failed_archive) && !file.is_loading_archive">
-                    <!-- Menu -->
-                    <div class="self-end mb-2">
-                      <i
-                          class="pi pi-ellipsis-h cursor-pointer hover:text-autonomi-gray-600"
-                          @click.stop="
-                          $event => {
-                            selectedFileItem = file;
-                            refFilesMenu.toggle($event);
-                          }
-                        "
-                      />
-                    </div>
-                  </template>
-                  <template v-else>
-                    <div class="self-end mb-2 h-4"></div>
-                  </template>
-
-                  <div class="flex flex-col items-center justify-center flex-1 min-h-0">
-                    <div class="flex-shrink-0 mb-3">
-                      <i v-if="file.is_failed_archive" class="pi pi-exclamation-triangle text-3xl text-red-500"/>
-                      <i v-else-if="file.is_loading_archive" class="pi pi-spinner pi-spin text-3xl text-blue-500"/>
-                      <i v-else-if="file.path" class="pi pi-file text-3xl"/>
-                      <i v-else
-                         :class="file.isArchive ? 'pi pi-box text-3xl text-amber-600 dark:text-amber-400' : 'pi pi-folder text-3xl'"/>
-                    </div>
-
-                    <div class="w-full px-1 min-h-0">
-                      <span
-                          class="text-center text-xs block w-full cursor-pointer overflow-hidden text-ellipsis"
-                          style="display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word;"
-                          :title="file.is_loading_archive ? `${file.name} (loading...)` : file.name"
-                          @click.stop="file.path ? handleLocalFileNameClick(file) : null"
-                      >
-                        {{ file.is_loading_archive ? `${file.name} (loading...)` : file.name }}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              </template>
-            </div>
-          </div>
+          <FileGrid
+            v-else-if="viewTypeVault === 'grid'"
+            :files="combinedLocalFiles"
+            :is-loading="pendingLocalStructure"
+            :show-load-button="false"
+            @item-click="handleLocalChangeDirectory"
+            @name-click="handleLocalFileNameClick"
+            @menu-click="handleFileMenuClick"
+          />
         </TabPanel>
 
         <!-- Uploads Tab -->
@@ -3304,7 +2840,7 @@ onMounted(async () => {
                     <div class="flex items-center gap-2">
                       <!-- Copy Data Address Button (for public uploads) -->
                       <button
-                          v-if="upload.fileAccess?.Public"
+                          v-if="upload.file_access?.Public"
                           @click="handleCopyUploadDataAddress(upload)"
                           class="p-1 text-xs bg-blue-100 hover:bg-blue-200 dark:bg-blue-900 dark:hover:bg-blue-800 text-blue-600 dark:text-blue-300 rounded transition-colors"
                           v-tooltip.top="'Copy Data Address'"
@@ -3314,7 +2850,7 @@ onMounted(async () => {
 
                       <!-- Copy Data Map Button (for private/vault uploads) -->
                       <button
-                          v-if="upload.fileAccess?.Private"
+                          v-if="upload.file_access?.Private"
                           @click="handleCopyUploadDataMap(upload)"
                           class="p-1 text-xs bg-purple-100 hover:bg-purple-200 dark:bg-purple-900 dark:hover:bg-purple-800 text-purple-600 dark:text-purple-300 rounded transition-colors"
                           v-tooltip.top="'Copy Data Map (HEX)'"
@@ -3551,15 +3087,12 @@ onMounted(async () => {
                           class="pi pi-refresh cursor-pointer text-gray-400 hover:text-blue-500 transition-colors"
                           @click.stop="() => {
                             // Remove the failed download entry and start a new download
-                            console.log('>>> Inline retry - failedDownload:', download);
                             
                             downloadsStore.removeDownload(download.id);
                             // Use the stored file object to retry download
                             if (download.fileObject) {
-                              console.log('>>> Inline retry - calling handleDownloadFile with stored fileObject');
                               handleDownloadFile(download.fileObject);
                             } else {
-                              console.log('>>> Inline retry - no fileObject stored in failed download');
                             }
                           }"
                           v-tooltip.top="'Retry download'"
@@ -3587,171 +3120,12 @@ onMounted(async () => {
 
 
     <!-- Upload Options Modal -->
-    <Dialog
-        v-model:visible="showUploadOptionsModal"
-        modal
-        header="Upload Options"
-        :style="{ width: '450px' }"
-        :closable="true"
-    >
-      <div class="flex flex-col gap-6 p-1">
-        <!-- File Info -->
-        <div class="bg-gray-50 dark:bg-autonomi-blue-600 rounded-lg p-4">
-          <div class="flex items-center gap-3">
-            <i :class="uploadOptionsData.isFolder ? 'pi pi-folder' : 'pi pi-file'" class="text-autonomi-blue-500"></i>
-            <div>
-              <div class="font-semibold text-sm">
-                {{ uploadOptionsData.isFolder ? 'Folder' : (uploadOptionsData.files.length === 1 ? 'File' : 'Files') }}
-              </div>
-              <div class="text-sm text-gray-600 dark:text-autonomi-secondary-dark">
-                {{
-                  uploadOptionsData.isFolder ? uploadOptionsData.files[0]?.name :
-                      (uploadOptionsData.files.length === 1 ? uploadOptionsData.files[0]?.name : `${uploadOptionsData.files.length} files`)
-                }}
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Privacy Options -->
-        <div class="space-y-3">
-          <div class="flex items-center gap-2">
-            <label class="text-sm font-semibold">Privacy</label>
-            <i
-                class="pi pi-info-circle text-sm text-gray-500 cursor-help"
-                v-tooltip="{
-                value: 'Private files require a data map to access them. Public files can be accessed by anyone who has the data address.',
-                showDelay: 300,
-                hideDelay: 300
-              }"
-            />
-          </div>
-          <div class="space-y-3">
-            <div class="flex items-center">
-              <RadioButton
-                  v-model="uploadOptionsData.isPrivate"
-                  inputId="private"
-                  name="privacy"
-                  :value="true"
-              />
-              <label for="private" class="ml-2 flex items-center gap-2 cursor-pointer">
-                <i class="pi pi-lock text-autonomi-blue-500"></i>
-                <div class="flex-1">
-                  <div class="font-medium">Private</div>
-                </div>
-                <i
-                    class="pi pi-info-circle text-xs text-gray-400 cursor-help"
-                    v-tooltip="{
-                    value: 'Files will be uploaded to the network, but they will only be accessible with the data map file.\n\nThis data map file will be stored locally on your device and will be viewable in your local vault.',
-                    showDelay: 300,
-                    hideDelay: 300,
-                    autoHide: false
-                  }"
-                />
-              </label>
-            </div>
-            <div class="flex items-center">
-              <RadioButton
-                  v-model="uploadOptionsData.isPrivate"
-                  inputId="public"
-                  name="privacy"
-                  :value="false"
-              />
-              <label for="public" class="ml-2 flex items-center gap-2 cursor-pointer">
-                <i class="pi pi-globe text-green-500"></i>
-                <div class="flex-1">
-                  <div class="font-medium">Public</div>
-                </div>
-                <i
-                    class="pi pi-info-circle text-xs text-gray-400 cursor-help"
-                    v-tooltip="{
-                    value: 'Files will be uploaded to the network and will be accessible to anyone with the data address.',
-                    showDelay: 300,
-                    hideDelay: 300,
-                    autoHide: false
-                  }"
-                />
-              </label>
-            </div>
-          </div>
-        </div>
-
-        <!-- Vault Options -->
-        <div class="space-y-3">
-          <div class="flex items-center gap-2">
-            <label class="text-sm font-semibold">Storage Options</label>
-          </div>
-          <div class="flex items-center">
-            <Checkbox
-                v-model="uploadOptionsData.addToVault"
-                inputId="vault"
-                :binary="true"
-            />
-            <label for="vault" class="ml-2 flex items-center gap-2 cursor-pointer">
-              <i class="pi pi-database text-autonomi-blue-500"></i>
-              <div class="flex-1">
-                <div class="font-medium">Add to Personal Vault</div>
-              </div>
-              <i
-                  class="pi pi-info-circle text-xs text-gray-400 cursor-help"
-                  v-tooltip="{
-                  value: 'Store a reference to your files in your personal vault for easy access from anywhere. When unchecked, files are stored only on the network and referenced in your local vault.',
-                  showDelay: 300,
-                  hideDelay: 300,
-                  autoHide: false
-                }"
-              />
-            </label>
-          </div>
-        </div>
-
-        <!-- Cached Receipts Option -->
-        <div class="space-y-3">
-          <div class="flex items-center gap-2">
-            <label class="text-sm font-semibold">Payment Options</label>
-          </div>
-          <div class="flex items-center">
-            <Checkbox
-                v-model="uploadOptionsData.useCachedReceipts"
-                inputId="use-cached"
-                :binary="true"
-            />
-            <label for="use-cached" class="ml-2 flex items-center gap-2 cursor-pointer">
-              <i class="pi pi-clock text-autonomi-blue-500"></i>
-              <div class="flex-1">
-                <div class="font-medium">Use Cached Receipts</div>
-                <div class="text-xs text-gray-500">If available</div>
-              </div>
-              <i
-                  class="pi pi-info-circle text-xs text-gray-400 cursor-help"
-                  v-tooltip="{
-                  value: 'Use previously cached payment receipts when available. If partial coverage, only pay for missing chunks. When unchecked, always requests fresh payment.',
-                  showDelay: 300,
-                  hideDelay: 300,
-                  autoHide: false
-                }"
-              />
-            </label>
-          </div>
-        </div>
-
-      </div>
-
-      <template #footer>
-        <div class="flex justify-end gap-3">
-          <Button
-              label="Cancel"
-              severity="secondary"
-              @click="handleCancelUploadOptions"
-              outlined
-          />
-          <Button
-              label="Upload"
-              @click="handleConfirmUploadOptions"
-          />
-        </div>
-      </template>
-    </Dialog>
+    <UploadOptionsDialog
+      v-model:visible="showUploadOptionsModal"
+      :options="uploadOptionsData"
+      @confirm="handleConfirmUploadOptions"
+      @cancel="handleCancelUploadOptions"
+    />
 
     <!-- Upload Progress Modal -->
     <DialogInvoice
@@ -3822,12 +3196,8 @@ onMounted(async () => {
             <li
                 v-for="item in menuUploadOptions"
                 :key="item.label"
-                class="flex items-center gap-2 py-3 px-5 rounded-border rounded-2xl"
-                :class="{
-                  'hover:bg-autonomi-gray-100 dark:hover:bg-autonomi-blue-600 cursor-pointer': !item.disabled,
-                  'opacity-50 cursor-not-allowed': item.disabled
-                }"
-                @click="!item.disabled && item.command && item.command()"
+                class="flex items-center gap-2 py-3 px-5 rounded-border rounded-2xl hover:bg-autonomi-gray-100 dark:hover:bg-autonomi-blue-600 cursor-pointer"
+                @click="item.command && item.command()"
             >
               <i :class="item.icon"/>
               <div>

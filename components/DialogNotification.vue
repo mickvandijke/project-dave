@@ -16,10 +16,10 @@ const emit = defineEmits(["close-notify"]);
 const notification = useDialogNotification();
 
 // Computed values that prefer props over store (for backwards compatibility)
-const isVisible = computed(() => props.visible ?? notification.isVisible.value);
-const currentTitle = computed(() => props.title ?? notification.title.value);
-const currentDetails = computed(() => props.details ?? notification.details.value);
-const currentCanCancel = computed(() => props.canCancel ?? notification.canCancel.value);
+const isVisible = computed(() => props.visible ?? notification.isVisible);
+const currentTitle = computed(() => props.title ?? notification.title);
+const currentDetails = computed(() => props.details ?? notification.details);
+const currentCanCancel = computed(() => props.canCancel ?? notification.canCancel);
 
 const handleCancelNotify = () => {
   // If using props, emit event

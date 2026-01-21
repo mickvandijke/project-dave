@@ -1,14 +1,15 @@
 <script lang="ts" setup>
-import {useToast} from "primevue/usetoast";
 import {useWalletStore} from "~/stores/wallet";
 import {storeToRefs} from "pinia";
+import {useNotifications} from "~/composables/useNotifications";
+
 // Login
 const props = defineProps<{
   visible: boolean;
 }>();
 
 const emit = defineEmits(["close-login"]);
-const toast = useToast();
+const { showError } = useNotifications();
 const walletStore = useWalletStore();
 const {pendingConnectWallet, wallet, callbackConnectWallet} = storeToRefs(walletStore);
 
@@ -34,12 +35,7 @@ const handleLogIn = async () => {
       throw new Error("Failed to log in");
     }
   } catch (error) {
-    toast.add({
-      severity: "error",
-      summary: "Error",
-      detail: "TEST: Failed to log in",
-      life: 3000,
-    });
+    showError("Error", "Failed to log in");
   } finally {
     emit("close-login");
   }

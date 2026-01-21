@@ -1,14 +1,15 @@
 <script lang="ts" setup>
-import {useToast} from "primevue/usetoast";
 import {useWalletStore} from "~/stores/wallet";
 import {storeToRefs} from "pinia";
+import {useNotifications} from "~/composables/useNotifications";
+
 // Login
 const props = defineProps<{
   visible: boolean;
 }>();
 
 const emit = defineEmits(["close-disconnect-wallet"]);
-const toast = useToast();
+const { showSuccess, showError } = useNotifications();
 const walletStore = useWalletStore();
 const {pendingDisconnectWallet, wallet} = storeToRefs(walletStore);
 
@@ -23,24 +24,13 @@ const handleDisconnectWallet = async () => {
     const response = await walletStore.disconnectWallet();
 
     if (response.success) {
-      toast.add({
-        severity: "success",
-        summary: "Success",
-        detail: "Mobile wallet disconnected successfully",
-        life: 3000,
-      });
-
+      showSuccess("Success", "Mobile wallet disconnected successfully");
       navigateTo("/");
     } else {
       throw new Error("Failed to disconnect mobile wallet");
     }
   } catch (error) {
-    toast.add({
-      severity: "error",
-      summary: "Error",
-      detail: error,
-      life: 3000,
-    });
+    showError("Error", error as Error);
   } finally {
     emit("close-disconnect-wallet");
   }
