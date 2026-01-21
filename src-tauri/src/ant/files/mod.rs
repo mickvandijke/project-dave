@@ -52,6 +52,348 @@ pub fn get_payment_cache() -> Result<&'static PaymentCache, &'static str> {
         .map_err(|_| "Payment cache not available")
 }
 
+// ============================================================================
+// Helper Functions - Phase 1
+// ============================================================================
+
+use autonomi::client::quote::StoreQuote;
+use autonomi::Client;
+use super::payments::Payment;
+
+/// Emits an upload-quote event with the given parameters.
+/// Consolidates the 8 identical quote emission patterns across upload functions.
+fn emit_upload_quote(
+    app: &AppHandle,
+    upload_id: &str,
+    total_files: usize,
+    total_size: u64,
+    total_cost: Amount,
+    payments: &[serde_json::Value],
+    raw_payments: &[Payment],
+) -> Result<(), UploadError> {
+    let has_payments = total_cost > Amount::ZERO;
+    app.emit(
+        "upload-quote",
+        serde_json::json!({
+            "upload_id": upload_id,
+            "total_files": total_files,
+            "total_size": total_size,
+            "total_cost_nano": total_cost.to_string(),
+            "total_cost_formatted": format!("{} ATTO", total_cost),
+            "payment_required": has_payments,
+            "payments": payments,
+            "raw_payments": raw_payments
+        }),
+    )
+    .map_err(|err| {
+        error!("Failed to emit upload-quote event: {}", err);
+        UploadError::EmitEvent(err.to_string())
+    })
+}
+
+/// Emits an upload-quote event with zero cost (for cached receipts).
+fn emit_zero_cost_quote(
+    app: &AppHandle,
+    upload_id: &str,
+    total_files: usize,
+    total_size: u64,
+) -> Result<(), UploadError> {
+    app.emit(
+        "upload-quote",
+        serde_json::json!({
+            "upload_id": upload_id,
+            "total_files": total_files,
+            "total_size": total_size,
+            "total_cost_nano": "0",
+            "total_cost_formatted": "0 ATTO",
+            "payment_required": false,
+            "payments": Vec::<serde_json::Value>::new(),
+            "raw_payments": Vec::<serde_json::Value>::new()
+        }),
+    )
+    .map_err(|err| UploadError::EmitEvent(err.to_string()))
+}
+
+/// Builds payment JSON array from store quote for emission.
+fn build_payments_json(store_quote: &StoreQuote) -> Vec<serde_json::Value> {
+    let total_cost: Amount = store_quote.payments().iter().map(|(_, _, amount)| *amount).sum();
+    if total_cost > Amount::ZERO {
+        store_quote
+            .payments()
+            .iter()
+            .map(|(addr, _, amount)| {
+                serde_json::json!({
+                    "address": hex::encode(addr),
+                    "amount": amount.to_string(),
+                    "amount_formatted": format!("{} ATTO", amount)
+                })
+            })
+            .collect()
+    } else {
+        vec![]
+    }
+}
+
+/// Gets raw payments from store quote filtered by non-zero amounts.
+fn get_raw_payments(store_quote: &StoreQuote) -> Vec<Payment> {
+    store_quote
+        .payments()
+        .into_iter()
+        .filter(|(_, _, amount)| *amount > Amount::ZERO)
+        .collect()
+}
+
+/// Retrieves user data from vault, creating new if vault doesn't exist yet.
+/// Consolidates the error handling pattern used in add_local_*_to_vault functions.
+async fn get_or_create_user_data(
+    client: &Client,
+    secret_key: &VaultSecretKey,
+) -> Result<UserData, VaultError> {
+    match client.vault_get_user_data(secret_key).await {
+        Ok(data) => {
+            debug!("Successfully retrieved user data from vault");
+            Ok(data)
+        }
+        Err(e) => {
+            debug!("Failed to get user data from vault: {:?}", e);
+            match &e {
+                UserDataVaultError::GetError(_) | UserDataVaultError::Vault(_) => {
+                    debug!("Vault might not exist yet, creating new user data");
+                    Ok(UserData::new())
+                }
+                _ => {
+                    error!("Other vault error, returning error");
+                    Err(VaultError::UserDataGet(e))
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions - Phase 2
+// ============================================================================
+
+/// Result of checking cached payment for a file or archive.
+struct CachedPaymentResult {
+    /// The cached receipt if found (partial or complete).
+    cached_receipt: Option<Receipt>,
+    /// True if the cached receipt is partial and needs additional payment.
+    need_additional_payment: bool,
+    /// XorName addresses of chunks missing from the cached receipt.
+    missing_chunks: Vec<Vec<u8>>,
+    /// True if the cached receipt fully covers all chunks.
+    is_fully_cached: bool,
+}
+
+/// Checks for cached payment for a file and validates its coverage.
+fn check_cached_payment_for_file(
+    cache: &PaymentCache,
+    file_path: &std::path::Path,
+    content_addresses: &[XorName],
+) -> CachedPaymentResult {
+    if let Ok(Some(cached_receipt)) = cache.load_payment_for_file(file_path) {
+        info!("Found cached payment, validating coverage...");
+        let validation =
+            validate_receipt_coverage_with_content_addresses(&cached_receipt, content_addresses);
+
+        if validation.is_complete {
+            CachedPaymentResult {
+                cached_receipt: Some(cached_receipt),
+                need_additional_payment: false,
+                missing_chunks: vec![],
+                is_fully_cached: true,
+            }
+        } else {
+            info!(
+                "Cached receipt is partial, missing {} chunks",
+                validation.missing_chunks.len()
+            );
+            CachedPaymentResult {
+                cached_receipt: Some(cached_receipt),
+                need_additional_payment: true,
+                missing_chunks: validation.missing_chunks,
+                is_fully_cached: false,
+            }
+        }
+    } else {
+        CachedPaymentResult {
+            cached_receipt: None,
+            need_additional_payment: false,
+            missing_chunks: vec![],
+            is_fully_cached: false,
+        }
+    }
+}
+
+/// Checks for cached payment for an archive and validates its coverage.
+fn check_cached_payment_for_archive(
+    cache: &PaymentCache,
+    files: &[File],
+    archive_name: &str,
+    content_addresses: &[XorName],
+) -> CachedPaymentResult {
+    if let Ok(Some(cached_receipt)) = cache.load_archive_payment(files, archive_name) {
+        info!("Found cached payment, validating coverage...");
+        let validation =
+            validate_receipt_coverage_with_content_addresses(&cached_receipt, content_addresses);
+
+        if validation.is_complete {
+            CachedPaymentResult {
+                cached_receipt: Some(cached_receipt),
+                need_additional_payment: false,
+                missing_chunks: vec![],
+                is_fully_cached: true,
+            }
+        } else {
+            info!(
+                "Cached receipt is partial, missing {} chunks",
+                validation.missing_chunks.len()
+            );
+            CachedPaymentResult {
+                cached_receipt: Some(cached_receipt),
+                need_additional_payment: true,
+                missing_chunks: validation.missing_chunks,
+                is_fully_cached: false,
+            }
+        }
+    } else {
+        CachedPaymentResult {
+            cached_receipt: None,
+            need_additional_payment: false,
+            missing_chunks: vec![],
+            is_fully_cached: false,
+        }
+    }
+}
+
+/// Fetches store quotes for chunks, either partial (missing only) or full.
+async fn fetch_store_quotes(
+    client: &Client,
+    all_content_addresses: Vec<(XorName, usize)>,
+    missing_chunks: Option<&[Vec<u8>]>,
+) -> Result<StoreQuote, UploadError> {
+    match missing_chunks {
+        Some(missing) if !missing.is_empty() => {
+            info!("Getting store quotes for {} missing chunks...", missing.len());
+            let missing_chunks_iter = all_content_addresses
+                .iter()
+                .filter(|(name, _)| missing.contains(&name.to_vec()))
+                .cloned();
+
+            client
+                .get_store_quotes(DataTypes::Chunk, missing_chunks_iter)
+                .await
+                .map_err(|err| {
+                    error!("Failed to get store quotes: {}", err);
+                    UploadError::StoreQuote(err.to_string())
+                })
+        }
+        _ => {
+            info!(
+                "Getting store quotes for {} chunks...",
+                all_content_addresses.len()
+            );
+            client
+                .get_store_quotes(DataTypes::Chunk, all_content_addresses.into_iter())
+                .await
+                .map_err(|err| {
+                    error!("Failed to get store quotes: {}", err);
+                    UploadError::StoreQuote(err.to_string())
+                })
+        }
+    }
+}
+
+/// Result of preparing a vault update.
+struct VaultUpdatePrep {
+    /// The vault quote merged with the provided store quote.
+    merged_quote: StoreQuote,
+    /// The vault update metadata for later use.
+    vault_update: vault::VaultUpdate,
+}
+
+/// Enum to specify what item is being added to the vault.
+enum VaultItem {
+    PrivateFile {
+        data_map_chunk: DataMapChunk,
+        name: String,
+    },
+    PublicFile {
+        data_address: DataAddress,
+        name: String,
+    },
+    PrivateArchive {
+        data_map_chunk: DataMapChunk,
+        name: String,
+    },
+    PublicArchive {
+        data_address: DataAddress,
+        name: String,
+    },
+}
+
+/// Prepares a vault update by getting vault quote and merging with store quote.
+async fn prepare_vault_update(
+    client: &Client,
+    secret_key: &VaultSecretKey,
+    store_quote: StoreQuote,
+    item: VaultItem,
+) -> Result<VaultUpdatePrep, UploadError> {
+    debug!("Getting vault quote for add_to_vault...");
+
+    let mut user_data = client
+        .vault_get_user_data(secret_key)
+        .await
+        .unwrap_or(UserData::new());
+
+    // Add the item to user data based on type
+    match &item {
+        VaultItem::PrivateFile { data_map_chunk, name } => {
+            user_data.private_files.insert(data_map_chunk.clone(), name.clone());
+        }
+        VaultItem::PublicFile { data_address, name } => {
+            user_data.public_files.insert(*data_address, name.clone());
+        }
+        VaultItem::PrivateArchive { data_map_chunk, name } => {
+            user_data.private_file_archives.insert(data_map_chunk.clone(), name.clone());
+        }
+        VaultItem::PublicArchive { data_address, name } => {
+            user_data.file_archives.insert(*data_address, name.clone());
+        }
+    }
+
+    let vault_data = user_data
+        .to_bytes()
+        .map_err(|e| UploadError::Serialization(e.to_string()))?;
+
+    let vault_quote_result = vault::vault_quote(client, vault_data, secret_key)
+        .await
+        .map_err(|e| UploadError::StoreQuote(e.to_string()))?;
+
+    info!("Got vault quote, merging with store quote");
+
+    let merged_quote = combine_quotes(vec![store_quote, vault_quote_result.quote]);
+
+    Ok(VaultUpdatePrep {
+        merged_quote,
+        vault_update: vault::VaultUpdate {
+            new_graph_entries: vault_quote_result.new_graph_entries,
+            new_scratchpad_derivations: vault_quote_result.new_scratchpad_derivations,
+        },
+    })
+}
+
+// ============================================================================
+// Helper Functions - Phase 3
+// ============================================================================
+
+/// Emits an upload progress event.
+fn emit_upload_progress(app: &AppHandle, progress: UploadProgress) -> Result<(), UploadError> {
+    app.emit("upload-progress", progress)
+        .map_err(|err| UploadError::EmitEvent(err.to_string()))
+}
+
 #[allow(dead_code)]
 pub async fn read_file_to_bytes(file_path: PathBuf) -> Result<Bytes, UploadError> {
     tokio::fs::read(file_path.clone())
@@ -175,210 +517,86 @@ pub async fn start_private_single_file_upload(
     info!("Got encryption stream with {} chunks", all_content_addresses.len());
 
     // Check for cached payment first (only if user wants to use cached receipts)
-    let mut cached_receipt_opt = None;
-    let mut need_additional_payment = false;
-    let mut missing_chunks = Vec::new();
+    let mut cached_result = CachedPaymentResult {
+        cached_receipt: None,
+        need_additional_payment: false,
+        missing_chunks: vec![],
+        is_fully_cached: false,
+    };
 
     if use_cached_receipts {
         if let Ok(cache) = get_payment_cache() {
             info!("Checking for cached payment for file: {:?}", file.path);
-            if let Ok(Some(cached_receipt)) = cache.load_payment_for_file(&file.path) {
-                info!("Found cached payment, validating coverage...");
+            let content_addresses: Vec<XorName> = all_content_addresses
+                .iter()
+                .map(|(address, _)| *address)
+                .collect();
 
-                let content_addresses: Vec<XorName> = all_content_addresses
-                    .iter()
-                    .map(|(address, _)| address)
-                    .cloned()
-                    .collect();
+            cached_result = check_cached_payment_for_file(cache, &file.path, &content_addresses);
 
-                // Validate that cached receipt covers all required chunks
-                let validation = validate_receipt_coverage_with_content_addresses(
-                    &cached_receipt,
-                    &content_addresses,
-                );
+            if cached_result.is_fully_cached {
+                info!("Cached receipt covers all chunks, reusing it for upload");
+                emit_zero_cost_quote(&app, &upload_id, 1, file_size)?;
 
-                if validation.is_complete {
-                    info!("Cached receipt covers all chunks, reusing it for upload");
-
-                    // Emit quote event with zero cost since we're using cached payment
-                    app.emit(
-                        "upload-quote",
-                        serde_json::json!({
-                            "upload_id": upload_id.clone(),
-                            "total_files": 1,
-                            "total_size": file_size,
-                            "total_cost_nano": "0",
-                            "total_cost_formatted": "0 ATTO",
-                            "payment_required": false,
-                            "payments": Vec::<serde_json::Value>::new(),
-                            "raw_payments": Vec::<serde_json::Value>::new()
-                        }),
-                    )
-                    .map_err(|err| UploadError::EmitEvent(err.to_string()))?;
-
-                    // Execute upload immediately with cached receipt
-                    return execute_private_single_file_upload(
-                        app,
-                        file,
-                        data_map_chunk,
-                        cached_receipt,
-                        Default::default(),
-                        vault_secret_key,
-                        upload_id,
-                        add_to_vault,
-                        shared_client,
-                    )
-                    .await;
-                } else {
-                    info!(
-                        ">>> Cached receipt is partial, missing {} chunks",
-                        validation.missing_chunks.len()
-                    );
-                    cached_receipt_opt = Some(cached_receipt);
-                    need_additional_payment = true;
-                    missing_chunks = validation.missing_chunks;
-                }
+                return execute_private_single_file_upload(
+                    app,
+                    file,
+                    data_map_chunk,
+                    cached_result.cached_receipt.unwrap(),
+                    Default::default(),
+                    vault_secret_key,
+                    upload_id,
+                    add_to_vault,
+                    shared_client,
+                )
+                .await;
             }
         }
     } else {
         info!("User chose not to use cached receipts, will request full payment");
     }
 
-    // Get quotes only for missing chunks if we have a partial cached receipt
-    let store_quote = if need_additional_payment && !missing_chunks.is_empty() {
-        info!(
-            "Getting store quotes for {} missing chunks...",
-            missing_chunks.len()
-        );
-
-        // Filter chunks to only include missing ones
-        let missing_chunks_iter = all_content_addresses
-            .iter()
-            .filter(|(name, _)| missing_chunks.contains(&name.to_vec()))
-            .cloned();
-
-        client
-            .get_store_quotes(DataTypes::Chunk, missing_chunks_iter)
-            .await
-            .map_err(|err| {
-                error!(">>> Failed to get store quotes: {}", err);
-                UploadError::StoreQuote(err.to_string())
-            })?
+    // Get store quotes (for missing chunks if partial, or all chunks if none cached)
+    let missing_refs = if cached_result.need_additional_payment {
+        Some(cached_result.missing_chunks.as_slice())
     } else {
-        info!(
-            "Getting store quotes for {} chunks...",
-            all_content_addresses.len()
-        );
-
-        client
-            .get_store_quotes(DataTypes::Chunk, all_content_addresses.into_iter())
-            .await
-            .map_err(|err| {
-                error!(">>> Failed to get store quotes: {}", err);
-                UploadError::StoreQuote(err.to_string())
-            })?
+        None
     };
-
+    let store_quote = fetch_store_quotes(&client, all_content_addresses, missing_refs).await?;
     info!("Got store quote successfully");
 
-    // If add_to_vault is true, get vault quote and add to total
-    let mut total_store_quote = store_quote;
-    let mut vault_update = Default::default();
-
-    if add_to_vault && vault_secret_key.is_some() {
-        let secret_key = vault_secret_key.as_ref().unwrap();
-        info!("Getting vault quote for add_to_vault...");
-        // We'll need to create the vault data containing the file info
-        let file_name = file.name.clone();
-
-        let mut user_data = client
-            .vault_get_user_data(&secret_key)
-            .await
-            .unwrap_or(UserData::new());
-
-        user_data
-            .private_files
-            .insert(data_map_chunk.clone(), file_name);
-
-        // Serialize user data to bytes for vault quote
-        let vault_data = user_data
-            .to_bytes()
-            .map_err(|e| UploadError::Serialization(e.to_string()))?;
-
-        // Get vault quote
-        let vault_quote_result = crate::ant::vault::vault_quote(&client, vault_data, secret_key)
-            .await
-            .map_err(|e| UploadError::StoreQuote(e.to_string()))?;
-
-        info!("Got vault quote, merging with store quote");
-        // Merge vault quote with store quote
-        total_store_quote.0.extend(vault_quote_result.quote.0);
-
-        vault_update = vault::VaultUpdate {
-            new_graph_entries: vault_quote_result.new_graph_entries,
-            new_scratchpad_derivations: vault_quote_result.new_scratchpad_derivations,
-        };
-    }
-
-    let total_cost: Amount = total_store_quote
-        .payments()
-        .iter()
-        .map(|(_, _, amount)| *amount)
-        .sum();
-    let has_payments = total_cost > Amount::ZERO;
-
-    // Emit quote event with cost information
-    let payments: Vec<serde_json::Value> = if has_payments {
-        total_store_quote
-            .payments()
-            .iter()
-            .map(|(addr, _, amount)| {
-                serde_json::json!({
-                    "address": hex::encode(addr),
-                    "amount": amount.to_string(),
-                    "amount_formatted": format!("{} {}", amount, "ATTO")
-                })
-            })
-            .collect()
-    } else {
-        vec![]
+    // If add_to_vault is true, get vault quote and merge with store quote
+    let (total_store_quote, vault_update) = match (add_to_vault, vault_secret_key.as_ref()) {
+        (true, Some(secret_key)) => {
+            let prep = prepare_vault_update(
+                &client,
+                secret_key,
+                store_quote,
+                VaultItem::PrivateFile {
+                    data_map_chunk: data_map_chunk.clone(),
+                    name: file.name.clone(),
+                },
+            )
+            .await?;
+            (prep.merged_quote, prep.vault_update)
+        }
+        _ => (store_quote, Default::default()),
     };
 
-    let raw_payments: Vec<_> = total_store_quote
-        .payments()
-        .into_iter()
-        .filter(|(_, _, amount)| *amount > Amount::ZERO)
-        .collect();
+    // Calculate total cost and emit quote event
+    let total_cost: Amount = total_store_quote.payments().iter().map(|(_, _, amount)| *amount).sum();
+    let payments = build_payments_json(&total_store_quote);
+    let raw_payments = get_raw_payments(&total_store_quote);
 
-    info!(
-        ">>> Emitting upload-quote event for upload_id: {}",
-        upload_id
-    );
-    app.emit(
-        "upload-quote",
-        serde_json::json!({
-            "upload_id": upload_id.clone(),
-            "total_files": 1,
-            "total_size": file_size,
-            "total_cost_nano": total_cost.to_string(),
-            "total_cost_formatted": format!("{} {}", total_cost, "ATTO"),
-            "payment_required": has_payments,
-            "payments": payments,
-            "raw_payments": raw_payments
-        }),
-    )
-    .map_err(|err| {
-        error!(">>> Failed to emit upload-quote event: {}", err);
-        UploadError::EmitEvent(err.to_string())
-    })?;
+    info!("Emitting upload-quote event for upload_id: {}", upload_id);
+    emit_upload_quote(&app, &upload_id, 1, file_size, total_cost, &payments, &raw_payments)?;
     info!("Successfully emitted upload-quote event");
 
     // If cost is 0, this is a duplicate file - skip upload and mark as completed
     if total_cost == Amount::ZERO {
         info!("Duplicate file detected (cost=0), marking as completed immediately for upload_id: {}", upload_id);
-        // Emit completion immediately for duplicate files
-        app.emit(
-            "upload-progress",
+        emit_upload_progress(
+            &app,
             UploadProgress::Completed {
                 upload_id: upload_id.clone(),
                 total_files: 1,
@@ -386,16 +604,11 @@ pub async fn start_private_single_file_upload(
                 add_to_vault,
                 file_access: Some(FileAccess::Private(data_map_chunk)),
             },
-        )
-        .map_err(|err| UploadError::EmitEvent(err.to_string()))?;
-        info!(
-            ">>> Emitted completion event for duplicate file upload_id: {}",
-            upload_id
-        );
+        )?;
+        info!("Emitted completion event for duplicate file upload_id: {}", upload_id);
     } else if let Some(pending_uploads) = pending_uploads {
         // Store upload data for later execution after payment
         let mut pending = pending_uploads.lock().await;
-
         pending.store_single_file(
             upload_id.clone(),
             file,
@@ -404,10 +617,9 @@ pub async fn start_private_single_file_upload(
             vault_update,
             vault_secret_key.cloned(),
             add_to_vault,
-            cached_receipt_opt,
+            cached_result.cached_receipt,
         );
     }
-    // If payment required, the execution will happen when confirm_upload_payment is called
 
     Ok(())
 }
@@ -559,11 +771,13 @@ pub async fn start_public_single_file_upload(
     pending_uploads: Option<&tokio::sync::Mutex<crate::PendingUploads>>,
 ) -> Result<(), UploadError> {
     info!(
-        ">>> start_single_file_upload_public called with upload_id: {}, add_to_vault: {}, use_cached_receipts: {}",
-        upload_id, add_to_vault, use_cached_receipts
+        upload_id = %upload_id,
+        add_to_vault = %add_to_vault,
+        use_cached_receipts = %use_cached_receipts,
+        "start_single_file_upload_public called"
     );
     let client = shared_client.get_client().await.map_err(|e| {
-        error!(">>> Failed to get client: {:?}", e);
+        error!("Failed to get client: {:?}", e);
         e
     })?;
 
@@ -588,235 +802,96 @@ pub async fn start_public_single_file_upload(
     ))?;
 
     // Check for cached payment first (only if user wants to use cached receipts)
-    let mut cached_receipt_opt = None;
-    let mut need_additional_payment = false;
-    let mut missing_chunks = Vec::new();
+    let mut cached_result = CachedPaymentResult {
+        cached_receipt: None,
+        need_additional_payment: false,
+        missing_chunks: vec![],
+        is_fully_cached: false,
+    };
 
     if use_cached_receipts {
         if let Ok(cache) = get_payment_cache() {
-            info!(
-                ">>> Checking for cached payment for public file: {:?}",
-                file.path
-            );
-            if let Ok(Some(cached_receipt)) = cache.load_payment_for_file(&file.path) {
-                info!("Found cached payment, validating coverage...");
+            info!("Checking for cached payment for public file: {:?}", file.path);
+            let content_addresses: Vec<XorName> = all_content_addresses
+                .iter()
+                .map(|(address, _)| *address)
+                .collect();
 
-                let content_addresses: Vec<XorName> = all_content_addresses
-                    .iter()
-                    .map(|(address, _)| address)
-                    .cloned()
-                    .collect();
+            cached_result = check_cached_payment_for_file(cache, &file.path, &content_addresses);
 
-                // Validate that cached receipt covers all required chunks and datamap
-                let validation = validate_receipt_coverage_with_content_addresses(
-                    &cached_receipt,
-                    &content_addresses,
-                );
+            if cached_result.is_fully_cached {
+                info!("Cached receipt covers all chunks, reusing it for public upload");
+                emit_zero_cost_quote(&app, &upload_id, 1, file_size)?;
 
-                if validation.is_complete {
-                    info!("Cached receipt covers all chunks and datamap, reusing it for public upload");
-
-                    // Emit quote event with zero cost since we're using cached payment
-                    app.emit(
-                        "upload-quote",
-                        serde_json::json!({
-                            "upload_id": upload_id.clone(),
-                            "total_files": 1,
-                            "total_size": file_size,
-                            "total_cost_nano": "0",
-                            "total_cost_formatted": "0 ATTO",
-                            "payment_required": false,
-                            "payments": Vec::<serde_json::Value>::new(),
-                            "raw_payments": Vec::<serde_json::Value>::new()
-                        }),
-                    )
-                    .map_err(|err| UploadError::EmitEvent(err.to_string()))?;
-
-                    // Execute upload immediately with cached receipt
-                    return execute_public_single_file_upload(
-                        app,
-                        file,
-                        data_map_chunk,
-                        cached_receipt,
-                        Default::default(),
-                        upload_id,
-                        add_to_vault,
-                        vault_secret_key,
-                        shared_client,
-                    )
-                    .await;
-                } else {
-                    info!(
-                        ">>> Cached receipt is partial, missing {} chunks",
-                        validation.missing_chunks.len()
-                    );
-                    cached_receipt_opt = Some(cached_receipt);
-                    need_additional_payment = true;
-                    missing_chunks = validation.missing_chunks;
-                }
+                return execute_public_single_file_upload(
+                    app,
+                    file,
+                    data_map_chunk,
+                    cached_result.cached_receipt.unwrap(),
+                    Default::default(),
+                    upload_id,
+                    add_to_vault,
+                    vault_secret_key,
+                    shared_client,
+                )
+                .await;
             }
         }
     } else {
         info!("User chose not to use cached receipts, will request full payment");
     }
 
-    // Get quotes only for missing chunks if we have a partial cached receipt
-    let store_quote = if need_additional_payment && !missing_chunks.is_empty() {
-        info!(
-            "Getting store quotes for {} missing chunks + datamap...",
-            missing_chunks.len()
-        );
-
-        // Filter chunks to only include missing ones
-        let missing_chunks_iter = all_content_addresses
-            .iter()
-            .filter(|(name, _)| missing_chunks.contains(&name.to_vec()))
-            .cloned();
-
-        client
-            .get_store_quotes(DataTypes::Chunk, missing_chunks_iter)
-            .await
-            .map_err(|err| {
-                error!(">>> Failed to get store quotes: {}", err);
-                UploadError::StoreQuote(err.to_string())
-            })?
+    // Get store quotes (for missing chunks if partial, or all chunks if none cached)
+    let missing_refs = if cached_result.need_additional_payment {
+        Some(cached_result.missing_chunks.as_slice())
     } else {
-        info!(
-            "Getting store quotes for {} chunks + datamap...",
-            all_content_addresses.len()
-        );
-
-        client
-            .get_store_quotes(DataTypes::Chunk, all_content_addresses.into_iter())
-            .await
-            .map_err(|err| {
-                error!("Failed to get store quotes: {}", err);
-                UploadError::StoreQuote(err.to_string())
-            })?
+        None
     };
-
+    let store_quote = fetch_store_quotes(&client, all_content_addresses, missing_refs).await?;
     info!("Got store quote successfully");
 
-    // If add_to_vault is true and vault_secret_key is provided, get vault quote and add to total
-    let mut total_store_quote = store_quote;
-    let mut vault_update = Default::default();
-
-    if add_to_vault && vault_secret_key.is_some() {
-        let secret_key = vault_secret_key.as_ref().unwrap();
-
-        info!("Getting vault quote for public file add_to_vault...");
-
-        // We'll need to create the vault data containing the file info
-        let file_name = file.name.clone();
-        let data_address = data_map_chunk.0.address();
-
-        // Create user data structure for this file
-        let mut user_data = client
-            .vault_get_user_data(secret_key)
-            .await
-            .unwrap_or(UserData::new());
-
-        user_data
-            .public_files
-            .insert(DataAddress::new(*data_address.xorname()), file_name);
-
-        // Serialize user data to bytes for vault quote
-        let vault_data = user_data
-            .to_bytes()
-            .map_err(|e| UploadError::Serialization(e.to_string()))?;
-
-        // Get vault quote
-        let vault_quote_result = crate::ant::vault::vault_quote(&client, vault_data, secret_key)
-            .await
-            .map_err(|e| UploadError::StoreQuote(e.to_string()))?;
-
-        info!("Got vault quote for public file, merging with store quote");
-
-        // Merge vault quote with store quote
-        total_store_quote.0.extend(vault_quote_result.quote.0);
-
-        vault_update = vault::VaultUpdate {
-            new_graph_entries: vault_quote_result.new_graph_entries,
-            new_scratchpad_derivations: vault_quote_result.new_scratchpad_derivations,
-        };
-    }
-
-    let total_cost: Amount = total_store_quote
-        .payments()
-        .iter()
-        .map(|(_, _, amount)| *amount)
-        .sum();
-
-    let has_payments = total_cost > Amount::ZERO;
-
-    // Emit quote event with cost information
-    let payments: Vec<serde_json::Value> = if has_payments {
-        total_store_quote
-            .payments()
-            .iter()
-            .map(|(addr, _, amount)| {
-                serde_json::json!({
-                    "address": hex::encode(addr),
-                    "amount": amount.to_string(),
-                    "amount_formatted": format!("{} {}", amount, "ATTO")
-                })
-            })
-            .collect()
-    } else {
-        vec![]
+    // If add_to_vault is true, get vault quote and merge with store quote
+    let (total_store_quote, vault_update) = match (add_to_vault, vault_secret_key.as_ref()) {
+        (true, Some(secret_key)) => {
+            let data_address = DataAddress::new(*data_map_chunk.0.address().xorname());
+            let prep = prepare_vault_update(
+                &client,
+                secret_key,
+                store_quote,
+                VaultItem::PublicFile {
+                    data_address,
+                    name: file.name.clone(),
+                },
+            )
+            .await?;
+            (prep.merged_quote, prep.vault_update)
+        }
+        _ => (store_quote, Default::default()),
     };
 
-    let raw_payments: Vec<_> = total_store_quote
-        .payments()
-        .into_iter()
-        .filter(|(_, _, amount)| *amount > Amount::ZERO)
-        .collect();
+    // Calculate total cost and emit quote event
+    let total_cost: Amount = total_store_quote.payments().iter().map(|(_, _, amount)| *amount).sum();
+    let payments = build_payments_json(&total_store_quote);
+    let raw_payments = get_raw_payments(&total_store_quote);
 
-    info!(
-        ">>> Emitting upload-quote event for public upload_id: {}",
-        upload_id
-    );
-
-    app.emit(
-        "upload-quote",
-        serde_json::json!({
-            "upload_id": upload_id.clone(),
-            "total_files": 1,
-            "total_size": file_size,
-            "total_cost_nano": total_cost.to_string(),
-            "total_cost_formatted": format!("{} {}", total_cost, "ATTO"),
-            "payment_required": has_payments,
-            "payments": payments,
-            "raw_payments": raw_payments
-        }),
-    )
-    .map_err(|err| {
-        error!(">>> Failed to emit upload-quote event: {}", err);
-        UploadError::EmitEvent(err.to_string())
-    })?;
+    info!("Emitting upload-quote event for public upload_id: {}", upload_id);
+    emit_upload_quote(&app, &upload_id, 1, file_size, total_cost, &payments, &raw_payments)?;
     debug!("Successfully emitted upload-quote event");
 
-    // If no payment required, proceed with upload
+    // If cost is 0, this is a duplicate file - skip upload and mark as completed
     if total_cost == Amount::ZERO {
         info!("Duplicate public file detected (cost=0), marking as completed immediately for upload_id: {}", upload_id);
-        // Emit completion immediately for duplicate files
-        app.emit(
-            "upload-progress",
+        emit_upload_progress(
+            &app,
             UploadProgress::Completed {
                 upload_id: upload_id.clone(),
                 total_files: 1,
                 total_bytes: file_size,
                 add_to_vault,
-                file_access: Some(FileAccess::Public(DataAddress::new(
-                    *data_map_chunk.0.name(),
-                ))),
+                file_access: Some(FileAccess::Public(DataAddress::new(*data_map_chunk.0.name()))),
             },
-        )
-        .map_err(|err| UploadError::EmitEvent(err.to_string()))?;
-        info!(
-            ">>> Emitted completion event for duplicate public file upload_id: {}",
-            upload_id
-        );
+        )?;
+        info!("Emitted completion event for duplicate public file upload_id: {}", upload_id);
     } else if let Some(pending_uploads) = pending_uploads {
         // Store upload data for later execution after payment
         let mut pending = pending_uploads.lock().await;
@@ -828,7 +903,7 @@ pub async fn start_public_single_file_upload(
             vault_update,
             add_to_vault,
             vault_secret_key.cloned(),
-            cached_receipt_opt,
+            cached_result.cached_receipt,
         );
     }
 
@@ -920,7 +995,7 @@ pub async fn execute_public_single_file_upload(
                 UploadProgress::Uploading {
                     upload_id: upload_id.clone(),
                     chunks_uploaded: total_chunks,
-                    total_chunks: total_chunks,
+                    total_chunks,
                     bytes_uploaded: file_size,
                     total_bytes: file_size,
                 },
@@ -1031,8 +1106,10 @@ pub async fn start_private_archive_upload(
     pending_uploads: Option<&tokio::sync::Mutex<crate::PendingUploads>>,
 ) -> Result<(), UploadError> {
     info!(
-        ">>> start_private_archive_upload called with upload_id: {}, add_to_vault: {}, use_cached_receipts: {}",
-        upload_id, add_to_vault, use_cached_receipts
+        upload_id = %upload_id,
+        add_to_vault = %add_to_vault,
+        use_cached_receipts = %use_cached_receipts,
+        "start_private_archive_upload called"
     );
 
     let client = shared_client.get_client().await?;
@@ -1051,33 +1128,23 @@ pub async fn start_private_archive_upload(
             .map_err(|_| UploadError::Read(file.path.clone()))?;
 
         if path_metadata.is_dir() {
-            // Handle directory - encrypt_file_or_folder will handle all files in the directory
-            info!(
-                ">>> Creating encryption streams for directory: {:?}",
-                file.path
-            );
-
+            info!("Creating encryption streams for directory: {:?}", file.path);
             let mut encryption_streams = encrypt_file_or_folder(file.path.clone(), false)
                 .await
                 .map_err(|err| UploadError::Encryption(format!("{:?}", err)))?;
 
-            // Each stream corresponds to a file in the directory
             for stream in &mut encryption_streams {
                 let file_path = PathBuf::from(&stream.file_path);
                 let file_metadata = stream.metadata.clone();
-
-                // Get content addresses from stream
                 let content_addresses = content_addresses_from_encryption_stream(stream).await;
                 all_content_addresses.extend(content_addresses.clone());
 
-                // Calculate relative path from the parent of the directory
                 let base_dir = file.path.parent().unwrap_or(&file.path);
                 let relative_path = file_path
                     .strip_prefix(base_dir)
                     .unwrap_or(&file_path)
                     .to_path_buf();
 
-                // Get datamap after stream is done
                 let datamap = stream
                     .data_map_chunk()
                     .ok_or(UploadError::Encryption("Failed to get datamap".to_string()))?;
@@ -1085,7 +1152,6 @@ pub async fn start_private_archive_upload(
                 private_archive.add_file(relative_path, datamap, file_metadata);
             }
         } else {
-            // Handle single file
             info!("Creating encryption stream for file: {:?}", file.path);
             let mut encryption_streams = encrypt_file_or_folder(file.path.clone(), false)
                 .await
@@ -1096,12 +1162,9 @@ pub async fn start_private_archive_upload(
                 .ok_or(UploadError::Encryption("Expected one stream".to_string()))?;
 
             let file_metadata = stream.metadata.clone();
-
-            // Get content addresses from stream
             let content_addresses = content_addresses_from_encryption_stream(stream).await;
             all_content_addresses.extend(content_addresses);
 
-            // Get datamap after stream is done
             let datamap = stream
                 .data_map_chunk()
                 .ok_or(UploadError::Encryption("Failed to get datamap".to_string()))?;
@@ -1123,236 +1186,102 @@ pub async fn start_private_archive_upload(
         .iter()
         .map(|chunk| (*chunk.name(), chunk.size()))
         .collect();
-
     all_content_addresses.extend(archive_content_addresses);
 
     let archive_datamap_chunk = DataMapChunk::from(archive_datamap.clone());
 
     // Check for cached payment first (only if user wants to use cached receipts)
-    let mut cached_receipt_opt = None;
-    let mut need_additional_payment = false;
-    let mut missing_chunk_addresses = Vec::new();
+    let mut cached_result = CachedPaymentResult {
+        cached_receipt: None,
+        need_additional_payment: false,
+        missing_chunks: vec![],
+        is_fully_cached: false,
+    };
 
     if use_cached_receipts {
         if let Ok(cache) = get_payment_cache() {
-            info!(
-                ">>> Checking for cached payment for private archive: {}",
-                archive_name
-            );
-            if let Ok(Some(cached_receipt)) = cache.load_archive_payment(&files, &archive_name) {
-                info!("Found cached payment, validating coverage...");
+            info!("Checking for cached payment for private archive: {}", archive_name);
+            let content_addresses: Vec<XorName> = all_content_addresses
+                .iter()
+                .map(|(address, _)| *address)
+                .collect();
 
-                let content_addresses: Vec<XorName> = all_content_addresses
-                    .iter()
-                    .map(|(address, _)| address)
-                    .cloned()
-                    .collect();
+            cached_result = check_cached_payment_for_archive(cache, &files, &archive_name, &content_addresses);
 
-                // Validate that cached receipt covers all required chunks
-                let validation = validate_receipt_coverage_with_content_addresses(
-                    &cached_receipt,
-                    &content_addresses,
-                );
+            if cached_result.is_fully_cached {
+                info!("Cached receipt covers all chunks, reusing it for private archive upload");
+                emit_zero_cost_quote(&app, &upload_id, total_files, total_size)?;
 
-                if validation.is_complete {
-                    info!("Cached receipt covers all chunks, reusing it for private archive upload");
-
-                    // Emit quote event with zero cost since we're using cached payment
-                    app.emit(
-                        "upload-quote",
-                        serde_json::json!({
-                            "upload_id": upload_id.clone(),
-                            "total_files": total_files,
-                            "total_size": total_size,
-                            "total_cost_nano": "0",
-                            "total_cost_formatted": "0 ATTO",
-                            "payment_required": false,
-                            "payments": Vec::<serde_json::Value>::new(),
-                            "raw_payments": Vec::<serde_json::Value>::new()
-                        }),
-                    )
-                    .map_err(|err| UploadError::EmitEvent(err.to_string()))?;
-
-                    // Execute upload immediately with cached receipt
-                    return execute_private_archive_upload(
-                        app,
-                        files,
-                        archive_name,
-                        archive_datamap_chunk,
-                        private_archive,
-                        cached_receipt,
-                        Default::default(),
-                        upload_id,
-                        add_to_vault,
-                        vault_secret_key,
-                        shared_client,
-                    )
-                    .await;
-                } else {
-                    info!(
-                        ">>> Cached receipt is partial, missing {} chunks",
-                        validation.missing_chunks.len()
-                    );
-                    cached_receipt_opt = Some(cached_receipt);
-                    need_additional_payment = true;
-                    missing_chunk_addresses = validation.missing_chunks;
-                }
+                return execute_private_archive_upload(
+                    app,
+                    files,
+                    archive_name,
+                    archive_datamap_chunk,
+                    private_archive,
+                    cached_result.cached_receipt.unwrap(),
+                    Default::default(),
+                    upload_id,
+                    add_to_vault,
+                    vault_secret_key,
+                    shared_client,
+                )
+                .await;
             }
         }
     } else {
         info!("User chose not to use cached receipts, will request full payment");
     }
 
-    // Get store quote for missing chunks if we have a partial cached receipt
-    let mut store_quote = if need_additional_payment && !missing_chunk_addresses.is_empty() {
-        info!(
-            "Getting store quotes for {} missing chunks...",
-            missing_chunk_addresses.len()
-        );
-
-        // Filter content addresses to only include missing ones
-        let missing_chunks_iter = all_content_addresses
-            .iter()
-            .filter(|(addr, _)| missing_chunk_addresses.contains(&addr.to_vec()))
-            .cloned();
-
-        client
-            .get_store_quotes(DataTypes::Chunk, missing_chunks_iter)
-            .await
-            .map_err(|err| {
-                error!(">>> Failed to get store quotes: {}", err);
-                UploadError::StoreQuote(err.to_string())
-            })?
+    // Get store quotes (for missing chunks if partial, or all chunks if none cached)
+    let missing_refs = if cached_result.need_additional_payment {
+        Some(cached_result.missing_chunks.as_slice())
     } else {
-        info!(
-            "Getting store quotes for {} chunks...",
-            all_content_addresses.len()
-        );
-
-        client
-            .get_store_quotes(DataTypes::Chunk, all_content_addresses.into_iter())
-            .await
-            .map_err(|err| {
-                error!("Failed to get store quotes: {}", err);
-                UploadError::StoreQuote(err.to_string())
-            })?
+        None
     };
-
+    let store_quote = fetch_store_quotes(&client, all_content_addresses, missing_refs).await?;
     debug!("Got store quote successfully");
 
-    // If add_to_vault is true and vault_secret_key is provided, get vault quote and add to total
-    let mut vault_update = Default::default();
-
-    if add_to_vault && vault_secret_key.is_some() {
-        let secret_key = vault_secret_key.as_ref().unwrap();
-        debug!("Getting vault quote for private archive add_to_vault...");
-        // We'll need to create the vault data containing the archive info
-        let archive_name_clone = archive_name.clone();
-
-        // Create user data structure for this archive
-        let mut user_data = client
-            .vault_get_user_data(secret_key)
-            .await
-            .unwrap_or(UserData::new());
-
-        user_data
-            .private_file_archives
-            .insert(archive_datamap_chunk.clone(), archive_name_clone);
-
-        // Serialize user data to bytes for vault quote
-        let vault_data = user_data
-            .to_bytes()
-            .map_err(|e| UploadError::Serialization(e.to_string()))?;
-
-        // Get vault quote
-        let vault_quote_result = crate::ant::vault::vault_quote(&client, vault_data, secret_key)
-            .await
-            .map_err(|e| UploadError::StoreQuote(e.to_string()))?;
-
-        info!("Got vault quote for private archive, merging with store quote");
-
-        // Merge vault quote with store quote
-        store_quote.0.extend(vault_quote_result.quote.0);
-
-        vault_update = vault::VaultUpdate {
-            new_graph_entries: vault_quote_result.new_graph_entries,
-            new_scratchpad_derivations: vault_quote_result.new_scratchpad_derivations,
-        };
-    }
-
-    let total_cost: Amount = store_quote
-        .payments()
-        .iter()
-        .map(|(_, _, amount)| *amount)
-        .sum();
-
-    let has_payments = total_cost > Amount::ZERO;
-
-    // Emit quote event with cost information
-    let payments: Vec<serde_json::Value> = if has_payments {
-        store_quote
-            .payments()
-            .iter()
-            .map(|(addr, _, amount)| {
-                serde_json::json!({
-                    "address": hex::encode(addr),
-                    "amount": amount.to_string(),
-                    "amount_formatted": format!("{} {}", amount, "ATTO")
-                })
-            })
-            .collect()
-    } else {
-        vec![]
+    // If add_to_vault is true, get vault quote and merge with store quote
+    let (total_store_quote, vault_update) = match (add_to_vault, vault_secret_key.as_ref()) {
+        (true, Some(secret_key)) => {
+            let prep = prepare_vault_update(
+                &client,
+                secret_key,
+                store_quote,
+                VaultItem::PrivateArchive {
+                    data_map_chunk: archive_datamap_chunk.clone(),
+                    name: archive_name.clone(),
+                },
+            )
+            .await?;
+            (prep.merged_quote, prep.vault_update)
+        }
+        _ => (store_quote, Default::default()),
     };
 
-    let raw_payments: Vec<_> = store_quote
-        .payments()
-        .into_iter()
-        .filter(|(_, _, amount)| *amount > Amount::ZERO)
-        .collect();
+    // Calculate total cost and emit quote event
+    let total_cost: Amount = total_store_quote.payments().iter().map(|(_, _, amount)| *amount).sum();
+    let payments = build_payments_json(&total_store_quote);
+    let raw_payments = get_raw_payments(&total_store_quote);
 
-    debug!(
-        upload_id = %upload_id,
-        "Emitting upload-quote event for private archive"
-    );
-    app.emit(
-        "upload-quote",
-        serde_json::json!({
-            "upload_id": upload_id.clone(),
-            "total_files": total_files,
-            "total_size": total_size,
-            "total_cost_nano": total_cost.to_string(),
-            "total_cost_formatted": format!("{} {}", total_cost, "ATTO"),
-            "payment_required": has_payments,
-            "payments": payments,
-            "raw_payments": raw_payments
-        }),
-    )
-    .map_err(|err| {
-        error!("Failed to emit upload-quote event: {}", err);
-        UploadError::EmitEvent(err.to_string())
-    })?;
+    debug!(upload_id = %upload_id, "Emitting upload-quote event for private archive");
+    emit_upload_quote(&app, &upload_id, total_files, total_size, total_cost, &payments, &raw_payments)?;
     debug!("Successfully emitted upload-quote event");
 
-    // If no payment required, proceed with upload
+    // If cost is 0, this is a duplicate archive - mark as completed
     if total_cost == Amount::ZERO {
         debug!(upload_id = %upload_id, "Duplicate private archive detected (cost=0), marking as completed immediately");
-        // Emit completion immediately for duplicate archives
-        app.emit(
-            "upload-progress",
+        emit_upload_progress(
+            &app,
             UploadProgress::Completed {
                 upload_id: upload_id.clone(),
-                total_files: total_files,
+                total_files,
                 total_bytes: total_size,
                 add_to_vault,
                 file_access: Some(FileAccess::Private(archive_datamap_chunk)),
             },
-        )
-        .map_err(|err| UploadError::EmitEvent(err.to_string()))?;
-        debug!(
-            upload_id = %upload_id,
-            "Emitted completion event for duplicate private archive"
-        );
+        )?;
+        debug!(upload_id = %upload_id, "Emitted completion event for duplicate private archive");
     } else if let Some(pending_uploads) = pending_uploads {
         // Store upload data for later execution after payment
         let mut pending = pending_uploads.lock().await;
@@ -1362,11 +1291,11 @@ pub async fn start_private_archive_upload(
             archive_name,
             archive_datamap_chunk,
             private_archive,
-            store_quote,
+            total_store_quote,
             vault_update,
             add_to_vault,
             vault_secret_key.cloned(),
-            cached_receipt_opt,
+            cached_result.cached_receipt,
         );
     }
 
@@ -1611,8 +1540,10 @@ pub async fn start_public_archive_upload(
     pending_uploads: Option<&tokio::sync::Mutex<crate::PendingUploads>>,
 ) -> Result<(), UploadError> {
     info!(
-        ">>> start_public_archive_upload called with upload_id: {}, add_to_vault: {}, use_cached_receipts: {}",
-        upload_id, add_to_vault, use_cached_receipts
+        upload_id = %upload_id,
+        add_to_vault = %add_to_vault,
+        use_cached_receipts = %use_cached_receipts,
+        "start_public_archive_upload called"
     );
 
     let client = shared_client.get_client().await?;
@@ -1631,27 +1562,18 @@ pub async fn start_public_archive_upload(
             .map_err(|_| UploadError::Read(file.path.clone()))?;
 
         if path_metadata.is_dir() {
-            // Handle directory - encrypt_file_or_folder will handle all files in the directory
-            info!(
-                ">>> Creating encryption streams for directory: {:?}",
-                file.path
-            );
-
+            info!("Creating encryption streams for directory: {:?}", file.path);
             let mut encryption_streams = encrypt_file_or_folder(file.path.clone(), true)
                 .await
                 .map_err(|err| UploadError::Encryption(format!("{:?}", err)))?;
 
-            // Each stream corresponds to a file in the directory
             for stream in &mut encryption_streams {
                 let file_path = PathBuf::from(stream.file_path.clone());
-
-                // Get file size from filesystem metadata
                 let file_size = fs::metadata(&file_path)
                     .await
                     .map_err(|_| UploadError::Read(file_path.clone()))?
                     .len();
 
-                // Get datamap from stream
                 let data_map_chunk =
                     stream
                         .data_map_chunk()
@@ -1660,7 +1582,6 @@ pub async fn start_public_archive_upload(
                             file_path
                         )))?;
 
-                // Calculate relative path from the parent of the directory
                 let base_dir = file.path.parent().unwrap_or(&file.path);
                 let relative_path = file_path
                     .strip_prefix(base_dir)
@@ -1668,7 +1589,6 @@ pub async fn start_public_archive_upload(
                     .to_path_buf();
 
                 let metadata = Metadata::new_with_size(file_size);
-
                 public_archive.add_file(
                     relative_path,
                     DataAddress::new(*data_map_chunk.0.name()),
@@ -1676,11 +1596,9 @@ pub async fn start_public_archive_upload(
                 );
 
                 let content_addresses = content_addresses_from_encryption_stream(stream).await;
-
                 all_content_addresses.extend(content_addresses);
             }
         } else {
-            // Handle single file
             info!("Creating encryption stream for file: {:?}", file.path);
             let mut encryption_streams = encrypt_file_or_folder(file.path.clone(), true)
                 .await
@@ -1690,7 +1608,6 @@ pub async fn start_public_archive_upload(
                 .first_mut()
                 .ok_or(UploadError::Encryption("Expected one stream".to_string()))?;
 
-            // Get file size from filesystem metadata
             let file_size = fs::metadata(&file.path)
                 .await
                 .map_err(|_| UploadError::Read(file.path.clone()))?
@@ -1701,7 +1618,6 @@ pub async fn start_public_archive_upload(
             ))?;
 
             let metadata = Metadata::new_with_size(file_size);
-
             public_archive.add_file(
                 file.path.clone(),
                 DataAddress::new(*data_map_chunk.0.name()),
@@ -1709,19 +1625,16 @@ pub async fn start_public_archive_upload(
             );
 
             let content_addresses = content_addresses_from_encryption_stream(stream).await;
-
             all_content_addresses.extend(content_addresses);
         }
     }
 
-    // Serialize and encrypt the archive metadata itself
-    // Note: We use the standard encrypt() for the archive metadata since it's small
+    // Serialize and encrypt the archive metadata
     let archive_bytes = public_archive
         .to_bytes()
         .map_err(|err| UploadError::Encryption(err.to_string()))?;
 
     info!("Encrypting archive");
-
     let (archive_datamap, archive_chunks) = autonomi::self_encryption::encrypt(archive_bytes)
         .map_err(|err| UploadError::Encryption(err.to_string()))?;
 
@@ -1733,246 +1646,113 @@ pub async fn start_public_archive_upload(
     let archive_content_addresses = total_archive_chunks
         .iter()
         .map(|chunk| (*chunk.address.xorname(), chunk.value.len()));
-
     all_content_addresses.extend(archive_content_addresses);
 
     // Check for cached payment first (only if user wants to use cached receipts)
-    let mut cached_receipt_opt = None;
-    let mut need_additional_payment = false;
-    let mut missing_chunks = Vec::new();
+    let mut cached_result = CachedPaymentResult {
+        cached_receipt: None,
+        need_additional_payment: false,
+        missing_chunks: vec![],
+        is_fully_cached: false,
+    };
 
     if use_cached_receipts {
         if let Ok(cache) = get_payment_cache() {
-            debug!(
-                archive_name = %archive_name,
-                "Checking for cached payment for public archive"
-            );
-            if let Ok(Some(cached_receipt)) = cache.load_archive_payment(&files, &archive_name) {
-                debug!("Found cached payment, validating coverage...");
+            debug!(archive_name = %archive_name, "Checking for cached payment for public archive");
+            let content_addresses: Vec<XorName> = all_content_addresses
+                .iter()
+                .map(|(address, _)| *address)
+                .collect();
 
-                let content_addresses: Vec<XorName> = all_content_addresses
-                    .iter()
-                    .map(|(address, _)| address)
-                    .cloned()
-                    .collect();
+            cached_result = check_cached_payment_for_archive(cache, &files, &archive_name, &content_addresses);
 
-                // Validate that cached receipt covers all required chunks
-                let validation = validate_receipt_coverage_with_content_addresses(
-                    &cached_receipt,
-                    &content_addresses,
-                );
+            if cached_result.is_fully_cached {
+                debug!("Cached receipt covers all chunks, reusing it for public archive upload");
+                emit_zero_cost_quote(&app, &upload_id, total_files, total_size)?;
 
-                if validation.is_complete {
-                    debug!("Cached receipt covers all chunks, reusing it for public archive upload");
-
-                    // Emit quote event with zero cost since we're using cached payment
-                    app.emit(
-                        "upload-quote",
-                        serde_json::json!({
-                            "upload_id": upload_id.clone(),
-                            "total_files": total_files,
-                            "total_size": total_size,
-                            "total_cost_nano": "0",
-                            "total_cost_formatted": "0 ATTO",
-                            "payment_required": false,
-                            "payments": Vec::<serde_json::Value>::new(),
-                            "raw_payments": Vec::<serde_json::Value>::new()
-                        }),
-                    )
-                    .map_err(|err| UploadError::EmitEvent(err.to_string()))?;
-
-                    // Execute upload immediately with cached receipt
-                    return execute_public_archive_upload(
-                        app,
-                        files,
-                        archive_name,
-                        public_archive,
-                        cached_receipt,
-                        Default::default(),
-                        upload_id,
-                        add_to_vault,
-                        vault_secret_key,
-                        shared_client,
-                    )
-                    .await;
-                } else {
-                    debug!(
-                        missing_chunks = %validation.missing_chunks.len(),
-                        "Cached receipt is partial"
-                    );
-                    cached_receipt_opt = Some(cached_receipt);
-                    need_additional_payment = true;
-                    missing_chunks = validation.missing_chunks;
-                }
+                return execute_public_archive_upload(
+                    app,
+                    files,
+                    archive_name,
+                    public_archive,
+                    cached_result.cached_receipt.unwrap(),
+                    Default::default(),
+                    upload_id,
+                    add_to_vault,
+                    vault_secret_key,
+                    shared_client,
+                )
+                .await;
             }
         }
     } else {
         debug!("User chose not to use cached receipts, will request full payment");
     }
 
-    // Get store quote for missing chunks if we have a partial cached receipt
-    let mut store_quote = if need_additional_payment && !missing_chunks.is_empty() {
-        debug!(
-            missing_chunks = %missing_chunks.len(),
-            "Getting store quotes for missing chunks"
-        );
-
-        // Filter chunks to only include missing ones
-        let missing_chunks_iter = all_content_addresses
-            .iter()
-            .filter(|(name, _)| missing_chunks.contains(&name.to_vec()))
-            .cloned();
-
-        client
-            .get_store_quotes(DataTypes::Chunk, missing_chunks_iter)
-            .await
-            .map_err(|err| {
-                error!("Failed to get store quotes: {}", err);
-                UploadError::StoreQuote(err.to_string())
-            })?
+    // Get store quotes (for missing chunks if partial, or all chunks if none cached)
+    let missing_refs = if cached_result.need_additional_payment {
+        Some(cached_result.missing_chunks.as_slice())
     } else {
-        debug!(
-            chunks = %all_content_addresses.len(),
-            "Getting store quotes for chunks"
-        );
-
-        client
-            .get_store_quotes(DataTypes::Chunk, all_content_addresses.into_iter())
-            .await
-            .map_err(|err| {
-                error!("Failed to get store quotes: {}", err);
-                UploadError::StoreQuote(err.to_string())
-            })?
+        None
     };
+    let store_quote = fetch_store_quotes(&client, all_content_addresses, missing_refs).await?;
 
-    // If add_to_vault is true and vault_secret_key is provided, get vault quote and add to total
-    let mut vault_update = Default::default();
-
-    if add_to_vault && vault_secret_key.is_some() {
-        let secret_key = vault_secret_key.as_ref().unwrap();
-
-        info!("Getting vault quote for public archive add_to_vault...");
-
-        // Create user data structure for this archive
-        let mut user_data = client
-            .vault_get_user_data(&secret_key)
-            .await
-            .unwrap_or(UserData::new());
-
-        user_data
-            .file_archives
-            .insert(public_data_address, archive_name.clone());
-
-        // Serialize user data to bytes for vault quote
-        let vault_data = user_data
-            .to_bytes()
-            .map_err(|e| UploadError::Serialization(e.to_string()))?;
-
-        // Get vault quote
-        let vault_quote_result = vault::vault_quote(&client, vault_data, secret_key)
-            .await
-            .map_err(|e| UploadError::StoreQuote(e.to_string()))?;
-
-        info!("Got vault quote for public archive, merging with store quote");
-
-        store_quote = combine_quotes(vec![store_quote, vault_quote_result.quote]);
-
-        vault_update = vault::VaultUpdate {
-            new_graph_entries: vault_quote_result.new_graph_entries,
-            new_scratchpad_derivations: vault_quote_result.new_scratchpad_derivations,
-        };
-    }
+    // If add_to_vault is true, get vault quote and merge with store quote
+    let (total_store_quote, vault_update) = match (add_to_vault, vault_secret_key.as_ref()) {
+        (true, Some(secret_key)) => {
+            let prep = prepare_vault_update(
+                &client,
+                secret_key,
+                store_quote,
+                VaultItem::PublicArchive {
+                    data_address: public_data_address,
+                    name: archive_name.clone(),
+                },
+            )
+            .await?;
+            (prep.merged_quote, prep.vault_update)
+        }
+        _ => (store_quote, Default::default()),
+    };
 
     info!("Got store quote successfully");
 
-    let total_cost: Amount = store_quote
-        .payments()
-        .iter()
-        .map(|(_, _, amount)| *amount)
-        .sum();
+    // Calculate total cost and emit quote event
+    let total_cost: Amount = total_store_quote.payments().iter().map(|(_, _, amount)| *amount).sum();
+    let payments = build_payments_json(&total_store_quote);
+    let raw_payments = get_raw_payments(&total_store_quote);
 
-    let has_payments = total_cost > Amount::ZERO;
-
-    // Emit quote event with cost information
-    let payments: Vec<serde_json::Value> = if has_payments {
-        store_quote
-            .payments()
-            .iter()
-            .map(|(addr, _, amount)| {
-                serde_json::json!({
-                    "address": hex::encode(addr),
-                    "amount": amount.to_string(),
-                    "amount_formatted": format!("{} {}", amount, "ATTO")
-                })
-            })
-            .collect()
-    } else {
-        vec![]
-    };
-
-    let raw_payments: Vec<_> = store_quote
-        .payments()
-        .into_iter()
-        .filter(|(_, _, amount)| *amount > Amount::ZERO)
-        .collect();
-
-    debug!(
-        upload_id = %upload_id,
-        "Emitting upload-quote event for public archive"
-    );
-    app.emit(
-        "upload-quote",
-        serde_json::json!({
-            "upload_id": upload_id.clone(),
-            "total_files": total_files,
-            "total_size": total_size,
-            "total_cost_nano": total_cost.to_string(),
-            "total_cost_formatted": format!("{} {}", total_cost, "ATTO"),
-            "payment_required": has_payments,
-            "payments": payments,
-            "raw_payments": raw_payments
-        }),
-    )
-    .map_err(|err| {
-        error!("Failed to emit upload-quote event: {}", err);
-        UploadError::EmitEvent(err.to_string())
-    })?;
+    debug!(upload_id = %upload_id, "Emitting upload-quote event for public archive");
+    emit_upload_quote(&app, &upload_id, total_files, total_size, total_cost, &payments, &raw_payments)?;
     debug!("Successfully emitted upload-quote event");
 
-    // If no payment required, proceed with upload
+    // If cost is 0, this is a duplicate archive - mark as completed
     if total_cost == Amount::ZERO {
         debug!(upload_id = %upload_id, "Duplicate public archive detected (cost=0), marking as completed immediately");
-        // Emit completion immediately for duplicate archives
-        app.emit(
-            "upload-progress",
+        emit_upload_progress(
+            &app,
             UploadProgress::Completed {
                 upload_id: upload_id.clone(),
-                total_files: total_files,
+                total_files,
                 total_bytes: total_size,
                 add_to_vault,
                 file_access: Some(FileAccess::Public(public_data_address)),
             },
-        )
-        .map_err(|err| UploadError::EmitEvent(err.to_string()))?;
-        debug!(
-            upload_id = %upload_id,
-            "Emitted completion event for duplicate public archive"
-        );
+        )?;
+        debug!(upload_id = %upload_id, "Emitted completion event for duplicate public archive");
     } else if let Some(pending_uploads) = pending_uploads {
         // Store upload data for later execution after payment
-        // Note: We cannot store encryption streams as they consume data during iteration.
-        // The streams will be recreated in execute_public_archive_upload when needed.
         let mut pending = pending_uploads.lock().await;
         pending.store_public_archive(
             upload_id.clone(),
             files,
             archive_name,
             public_archive,
-            store_quote,
+            total_store_quote,
             vault_update,
             add_to_vault,
             vault_secret_key.cloned(),
-            cached_receipt_opt,
+            cached_result.cached_receipt,
         );
     }
 
@@ -2860,57 +2640,47 @@ pub async fn remove_from_vault(
     Ok(())
 }
 
-pub async fn add_local_archive_to_vault(
+/// Adds an item (file or archive) to the vault.
+/// This is the unified implementation for both files and archives.
+async fn add_item_to_vault_impl(
+    client: &Client,
     secret_key: &VaultSecretKey,
-    archive_access: FileAccess,
-    archive_name: &str,
-    shared_client: State<'_, SharedClient>,
+    file_access: FileAccess,
+    name: &str,
+    is_archive: bool,
 ) -> Result<(), VaultError> {
-    let client = shared_client.get_client().await?;
-
+    let item_type = if is_archive { "archive" } else { "file" };
     debug!(
-        archive_name = %archive_name,
-        archive_access = ?archive_access,
-        "add_local_archive_to_vault"
+        name = %name,
+        access = ?file_access,
+        item_type = %item_type,
+        "add_item_to_vault"
     );
 
-    // Get current user data from vault
-    let mut user_data = match client.vault_get_user_data(secret_key).await {
-        Ok(data) => {
-            debug!("Successfully retrieved user data from vault");
-            data
-        }
-        Err(e) => {
-            debug!("Failed to get user data from vault: {:?}", e);
-            // Check if this is a case where the vault doesn't exist yet
-            match &e {
-                UserDataVaultError::GetError(_) | UserDataVaultError::Vault(_) => {
-                    debug!("Vault might not exist yet, creating new user data");
-                    UserData::new()
-                }
-                _ => {
-                    error!("Other vault error, returning error");
-                    return Err(VaultError::UserDataGet(e));
-                }
-            }
-        }
-    };
+    // Get current user data from vault (or create new if vault doesn't exist)
+    let mut user_data = get_or_create_user_data(client, secret_key).await?;
 
-    // Handle both private and public archives
-    match archive_access {
-        FileAccess::Private(data_map) => {
-            // Add to private archives
+    // Handle based on access type and whether it's a file or archive
+    match (&file_access, is_archive) {
+        (FileAccess::Private(data_map), true) => {
             user_data
                 .private_file_archives
-                .insert(data_map, archive_name.to_string());
-            debug!("Added private archive to vault: {}", archive_name);
+                .insert(data_map.clone(), name.to_string());
+            debug!("Added private archive to vault: {}", name);
         }
-        FileAccess::Public(data_addr) => {
-            // Add to public archives
+        (FileAccess::Public(data_addr), true) => {
+            user_data.file_archives.insert(*data_addr, name.to_string());
+            debug!("Added public archive to vault: {}", name);
+        }
+        (FileAccess::Private(data_map), false) => {
             user_data
-                .file_archives
-                .insert(data_addr, archive_name.to_string());
-            debug!("Added public archive to vault: {}", archive_name);
+                .private_files
+                .insert(data_map.clone(), name.to_string());
+            debug!("Added private file to vault: {}", name);
+        }
+        (FileAccess::Public(data_addr), false) => {
+            user_data.public_files.insert(*data_addr, name.to_string());
+            debug!("Added public file to vault: {}", name);
         }
     }
 
@@ -2927,8 +2697,18 @@ pub async fn add_local_archive_to_vault(
             VaultError::FileNotFound
         })?;
 
-    debug!("Successfully updated vault with new archive");
+    debug!("Successfully updated vault with new {}", item_type);
     Ok(())
+}
+
+pub async fn add_local_archive_to_vault(
+    secret_key: &VaultSecretKey,
+    archive_access: FileAccess,
+    archive_name: &str,
+    shared_client: State<'_, SharedClient>,
+) -> Result<(), VaultError> {
+    let client = shared_client.get_client().await?;
+    add_item_to_vault_impl(&client, secret_key, archive_access, archive_name, true).await
 }
 
 pub async fn add_local_file_to_vault(
@@ -2938,66 +2718,5 @@ pub async fn add_local_file_to_vault(
     shared_client: State<'_, SharedClient>,
 ) -> Result<(), VaultError> {
     let client = shared_client.get_client().await?;
-
-    debug!(
-        file_name = %file_name,
-        file_access = ?file_access,
-        "add_local_file_to_vault"
-    );
-
-    // Get current user data from vault
-    let mut user_data = match client.vault_get_user_data(secret_key).await {
-        Ok(data) => {
-            debug!("Successfully retrieved user data from vault");
-            data
-        }
-        Err(e) => {
-            debug!("Failed to get user data from vault: {:?}", e);
-            // Check if this is a case where the vault doesn't exist yet
-            match &e {
-                UserDataVaultError::GetError(_) | UserDataVaultError::Vault(_) => {
-                    debug!("Vault might not exist yet, creating new user data");
-                    UserData::new()
-                }
-                _ => {
-                    error!("Other vault error, returning error");
-                    return Err(VaultError::UserDataGet(e));
-                }
-            }
-        }
-    };
-
-    // Handle both private and public files
-    match file_access {
-        FileAccess::Private(data_map) => {
-            // Add to private files
-            user_data
-                .private_files
-                .insert(data_map, file_name.to_string());
-            debug!("Added private file to vault: {}", file_name);
-        }
-        FileAccess::Public(data_addr) => {
-            // Add to public files
-            user_data
-                .public_files
-                .insert(data_addr, file_name.to_string());
-            debug!("Added public file to vault: {}", file_name);
-        }
-    }
-
-    // Save the updated user data back to vault
-    client
-        .vault_put_user_data(
-            secret_key,
-            PaymentOption::Receipt(Default::default()),
-            user_data,
-        )
-        .await
-        .map_err(|e| {
-            error!("Failed to put user data to vault: {:?}", e);
-            VaultError::FileNotFound
-        })?;
-
-    debug!("Successfully updated vault with new file");
-    Ok(())
+    add_item_to_vault_impl(&client, secret_key, file_access, file_name, false).await
 }
