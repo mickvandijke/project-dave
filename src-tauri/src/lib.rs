@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::ant::client::SharedClient;
-use crate::ant::files::{File, FileAccess};
+use crate::ant::files::{ExecuteUploadContext, File, FileAccess, StartUploadOptions};
 use crate::ant::payments::{OrderID, OrderMessage, PaymentOrderManager};
 use crate::ant::vault::{parse_vault_key, VaultUpdate};
 use ant::{
@@ -73,110 +73,9 @@ pub struct PendingUploads {
 }
 
 impl PendingUploads {
-    pub fn store_single_file(
-        &mut self,
-        upload_id: String,
-        file: File,
-        datamap: DataMapChunk,
-        store_quote: StoreQuote,
-        vault_update: VaultUpdate,
-        secret_key: Option<VaultSecretKey>,
-        add_to_vault: bool,
-        cached_receipt: Option<Receipt>,
-    ) {
-        self.uploads.insert(
-            upload_id,
-            PendingUploadData::SingleFile {
-                file,
-                datamap,
-                store_quote,
-                vault_update,
-                secret_key,
-                add_to_vault,
-                cached_receipt,
-            },
-        );
-    }
-
-    pub fn store_single_file_public(
-        &mut self,
-        upload_id: String,
-        file: File,
-        datamap: DataMapChunk,
-        store_quote: StoreQuote,
-        vault_update: VaultUpdate,
-        add_to_vault: bool,
-        vault_secret_key: Option<VaultSecretKey>,
-        cached_receipt: Option<Receipt>,
-    ) {
-        self.uploads.insert(
-            upload_id,
-            PendingUploadData::SingleFilePublic {
-                file,
-                datamap,
-                store_quote,
-                vault_update,
-                add_to_vault,
-                vault_secret_key,
-                cached_receipt,
-            },
-        );
-    }
-
-    pub fn store_public_archive(
-        &mut self,
-        upload_id: String,
-        files: Vec<File>,
-        archive_name: String,
-        archive: PublicArchive,
-        store_quote: StoreQuote,
-        vault_update: VaultUpdate,
-        add_to_vault: bool,
-        vault_secret_key: Option<VaultSecretKey>,
-        cached_receipt: Option<Receipt>,
-    ) {
-        self.uploads.insert(
-            upload_id,
-            PendingUploadData::PublicArchive {
-                files,
-                archive_name,
-                archive,
-                store_quote,
-                vault_update,
-                add_to_vault,
-                vault_secret_key,
-                cached_receipt,
-            },
-        );
-    }
-
-    pub fn store_private_archive(
-        &mut self,
-        upload_id: String,
-        files: Vec<File>,
-        archive_name: String,
-        archive_datamap: DataMapChunk,
-        archive: PrivateArchive,
-        store_quote: StoreQuote,
-        vault_update: VaultUpdate,
-        add_to_vault: bool,
-        vault_secret_key: Option<VaultSecretKey>,
-        cached_receipt: Option<Receipt>,
-    ) {
-        self.uploads.insert(
-            upload_id,
-            PendingUploadData::PrivateArchive {
-                files,
-                archive_name,
-                archive_datamap,
-                archive,
-                store_quote,
-                vault_update,
-                add_to_vault,
-                vault_secret_key,
-                cached_receipt,
-            },
-        );
+    /// Stores pending upload data by upload ID.
+    pub fn store(&mut self, upload_id: String, data: PendingUploadData) {
+        self.uploads.insert(upload_id, data);
     }
 
     pub fn take(&mut self, upload_id: &str) -> Option<PendingUploadData> {
@@ -192,6 +91,15 @@ pub struct AppStateInner {
 #[derive(Debug, serde::Serialize)]
 struct CommandError {
     message: String,
+}
+
+impl CommandError {
+    /// Creates a CommandError from any error type that implements Display.
+    fn from_err(e: impl std::fmt::Display) -> Self {
+        Self {
+            message: e.to_string(),
+        }
+    }
 }
 
 impl Default for AppStateInner {
@@ -214,15 +122,16 @@ async fn app_data(state: State<'_, AppState>) -> Result<AppData, ()> {
 }
 
 #[tauri::command]
-async fn app_data_store(state: State<'_, AppState>, app_data: AppData) -> Result<(), ()> {
+async fn app_data_store(state: State<'_, AppState>, app_data: AppData) -> Result<(), CommandError> {
     let mut state = state.lock().await;
 
     info!("updating app data: {app_data:?}");
     state.app_data = app_data;
-    state.app_data.store().map_err(|_err| ()) // TODO: Map to serializable error
+    state.app_data.store().map_err(CommandError::from_err)
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command - parameters come from frontend
 async fn start_upload(
     app: AppHandle,
     files: Vec<File>,
@@ -246,9 +155,7 @@ async fn start_upload(
             autonomi::client::vault::key::vault_key_from_signature_hex(
                 vault_key_signature.trim_start_matches("0x"),
             )
-            .map_err(|e| CommandError {
-                message: e.to_string(),
-            })?,
+            .map_err(CommandError::from_err)?,
         )
     } else {
         None
@@ -263,38 +170,35 @@ async fn start_upload(
         }
     };
 
+    let options = StartUploadOptions {
+        upload_id: upload_id.clone(),
+        add_to_vault,
+        use_cached_receipts,
+        vault_secret_key,
+    };
+
     if is_single_file {
         if is_private {
             ant::files::start_private_single_file_upload(
                 app,
                 files.into_iter().next().unwrap(),
-                vault_secret_key.as_ref(),
-                upload_id.clone(),
-                add_to_vault,
-                use_cached_receipts,
+                options,
                 shared_client,
                 Some(&*pending_uploads),
             )
             .await
-            .map_err(|e| CommandError {
-                message: e.to_string(),
-            })?;
+            .map_err(CommandError::from_err)?;
         } else {
             // Public file upload - vault key is optional
             ant::files::start_public_single_file_upload(
                 app,
                 files.into_iter().next().unwrap(),
-                upload_id.clone(),
-                add_to_vault,
-                use_cached_receipts,
-                vault_secret_key.as_ref(),
+                options,
                 shared_client,
                 Some(&*pending_uploads),
             )
             .await
-            .map_err(|e| CommandError {
-                message: e.to_string(),
-            })?;
+            .map_err(CommandError::from_err)?;
         }
     } else {
         // Archive uploads - support both public and private archives
@@ -306,34 +210,24 @@ async fn start_upload(
                 app,
                 files,
                 archive_name,
-                upload_id.clone(),
-                add_to_vault,
-                use_cached_receipts,
-                vault_secret_key.as_ref(),
+                options,
                 shared_client,
                 Some(&*pending_uploads),
             )
             .await
-            .map_err(|e| CommandError {
-                message: e.to_string(),
-            })?;
+            .map_err(CommandError::from_err)?;
         } else {
             // Public archive upload - vault key is optional (only needed for add_to_vault)
             ant::files::start_public_archive_upload(
                 app,
                 files,
                 archive_name,
-                upload_id.clone(),
-                add_to_vault,
-                use_cached_receipts,
-                vault_secret_key.as_ref(),
+                options,
                 shared_client,
                 Some(&*pending_uploads),
             )
             .await
-            .map_err(|e| CommandError {
-                message: e.to_string(),
-            })?;
+            .map_err(CommandError::from_err)?;
         }
     }
 
@@ -370,17 +264,17 @@ async fn confirm_upload_payment(
                     app,
                     file,
                     datamap,
-                    final_receipt,
-                    vault_update,
-                    secret_key.as_ref(),
-                    upload_id,
-                    add_to_vault,
+                    ExecuteUploadContext {
+                        upload_id,
+                        add_to_vault,
+                        receipt: final_receipt,
+                        vault_update,
+                        vault_secret_key: secret_key,
+                    },
                     shared_client,
                 )
                 .await
-                .map_err(|e| CommandError {
-                    message: e.to_string(),
-                })?;
+                .map_err(CommandError::from_err)?;
             }
             PendingUploadData::SingleFilePublic {
                 file,
@@ -399,17 +293,17 @@ async fn confirm_upload_payment(
                     app,
                     file,
                     datamap,
-                    final_receipt,
-                    vault_update,
-                    upload_id,
-                    add_to_vault,
-                    vault_secret_key.as_ref(),
+                    ExecuteUploadContext {
+                        upload_id,
+                        add_to_vault,
+                        receipt: final_receipt,
+                        vault_update,
+                        vault_secret_key,
+                    },
                     shared_client,
                 )
                 .await
-                .map_err(|e| CommandError {
-                    message: e.to_string(),
-                })?;
+                .map_err(CommandError::from_err)?;
             }
             PendingUploadData::PublicArchive {
                 files,
@@ -430,17 +324,17 @@ async fn confirm_upload_payment(
                     files,
                     archive_name,
                     archive,
-                    final_receipt,
-                    vault_update,
-                    upload_id,
-                    add_to_vault,
-                    vault_secret_key.as_ref(),
+                    ExecuteUploadContext {
+                        upload_id,
+                        add_to_vault,
+                        receipt: final_receipt,
+                        vault_update,
+                        vault_secret_key,
+                    },
                     shared_client,
                 )
                 .await
-                .map_err(|e| CommandError {
-                    message: e.to_string(),
-                })?;
+                .map_err(CommandError::from_err)?;
             }
             PendingUploadData::PrivateArchive {
                 files,
@@ -463,17 +357,17 @@ async fn confirm_upload_payment(
                     archive_name,
                     archive_datamap,
                     archive,
-                    final_receipt,
-                    vault_update,
-                    upload_id,
-                    add_to_vault,
-                    vault_secret_key.as_ref(),
+                    ExecuteUploadContext {
+                        upload_id,
+                        add_to_vault,
+                        receipt: final_receipt,
+                        vault_update,
+                        vault_secret_key,
+                    },
                     shared_client,
                 )
                 .await
-                .map_err(|e| CommandError {
-                    message: e.to_string(),
-                })?;
+                .map_err(CommandError::from_err)?;
             }
         }
     } else {
@@ -497,9 +391,7 @@ async fn send_payment_order_message(
     payment_orders
         .send_order_message(id, message)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
@@ -507,15 +399,11 @@ async fn get_vault_structure(
     vault_key_signature: String,
     shared_client: State<'_, SharedClient>,
 ) -> Result<VaultStructure, CommandError> {
-    let secret_key = parse_vault_key(&vault_key_signature).map_err(|e| CommandError {
-        message: e.to_string(),
-    })?;
+    let secret_key = parse_vault_key(&vault_key_signature).map_err(CommandError::from_err)?;
 
     ant::files::get_vault_structure(&secret_key, shared_client)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
@@ -525,15 +413,11 @@ async fn get_vault_structure_streaming(
     temp_code: String,
     shared_client: State<'_, SharedClient>,
 ) -> Result<(), CommandError> {
-    let secret_key = parse_vault_key(&vault_key_signature).map_err(|e| CommandError {
-        message: e.to_string(),
-    })?;
+    let secret_key = parse_vault_key(&vault_key_signature).map_err(CommandError::from_err)?;
 
     ant::files::get_vault_structure_streaming(app, &secret_key, temp_code, shared_client)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
@@ -541,15 +425,11 @@ async fn get_files_from_vault(
     vault_key_signature: String,
     shared_client: State<'_, SharedClient>,
 ) -> Result<Vec<FileFromVault>, CommandError> {
-    let secret_key = parse_vault_key(&vault_key_signature).map_err(|e| CommandError {
-        message: e.to_string(),
-    })?;
+    let secret_key = parse_vault_key(&vault_key_signature).map_err(CommandError::from_err)?;
 
     ant::files::get_files_from_vault(&secret_key, shared_client)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
@@ -559,15 +439,11 @@ async fn remove_from_vault(
     archive_address: Option<String>,
     shared_client: State<'_, SharedClient>,
 ) -> Result<(), CommandError> {
-    let secret_key = parse_vault_key(&vault_key_signature).map_err(|e| CommandError {
-        message: e.to_string(),
-    })?;
+    let secret_key = parse_vault_key(&vault_key_signature).map_err(CommandError::from_err)?;
 
     ant::files::remove_from_vault(&secret_key, &file_path, archive_address, shared_client)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
@@ -661,9 +537,7 @@ async fn add_to_vault_with_analysis(
     let client = shared_client
         .get_client()
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })?;
+        .map_err(CommandError::from_err)?;
 
     // Analyze the data type to determine if it's a file or archive
     let result = match &file_access {
@@ -737,9 +611,7 @@ async fn download_private_file(
 ) -> Result<(), CommandError> {
     ant::files::download_private(&data_map_chunk, to_dest, shared_client)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
@@ -750,9 +622,7 @@ async fn download_public_file(
 ) -> Result<(), CommandError> {
     ant::files::download_public(&addr, to_dest, shared_client)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
@@ -760,10 +630,10 @@ async fn get_single_file_data(
     vault_key_signature: String,
     file_path: String,
     shared_client: State<'_, SharedClient>,
-) -> Result<FileFromVault, ()> {
+) -> Result<FileFromVault, CommandError> {
     ant::files::get_single_file_data(&vault_key_signature, &file_path, shared_client)
         .await
-        .map_err(|_err| ()) // TODO: Map to serializable error
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
@@ -774,9 +644,7 @@ async fn confirm_payment(
     payment_orders
         .confirm_payment(order_id as u16)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
@@ -791,9 +659,7 @@ async fn show_item_in_file_manager(app: AppHandle, path: String) -> Result<(), S
 
 #[tauri::command]
 async fn get_local_files() -> Result<LocalFileData, CommandError> {
-    ant::local_storage::get_all_local_files().map_err(|err| CommandError {
-        message: err.to_string(),
-    })
+    ant::local_storage::get_all_local_files().map_err(CommandError::from_err)
 }
 
 #[tauri::command]
@@ -804,21 +670,15 @@ async fn load_local_private_archive(
     let client = shared_client
         .get_client()
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })?;
+        .map_err(CommandError::from_err)?;
 
     let archive_datamap = ant::local_storage::get_local_private_archive_access(&local_addr)
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })?;
+        .map_err(CommandError::from_err)?;
 
     let archive = client
         .archive_get(&archive_datamap)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })?;
+        .map_err(CommandError::from_err)?;
 
     let mut files = Vec::new();
     for (filepath, (data_map, metadata)) in archive.map() {
@@ -840,21 +700,15 @@ async fn load_local_public_archive(
     let client = shared_client
         .get_client()
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })?;
+        .map_err(CommandError::from_err)?;
 
     let archive_address = ant::local_storage::get_local_public_archive_address(&address_hex)
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })?;
+        .map_err(CommandError::from_err)?;
 
     let archive = client
         .archive_get_public(&archive_address)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })?;
+        .map_err(CommandError::from_err)?;
 
     let mut files = Vec::new();
     for (filepath, (data_addr, metadata)) in archive.map() {
@@ -876,45 +730,35 @@ async fn get_local_structure_streaming(
 ) -> Result<(), CommandError> {
     ant::local_storage::get_local_structure_streaming(app, temp_code, shared_client)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
 async fn delete_local_public_file(address: String) -> Result<(), CommandError> {
     ant::local_storage::delete_local_public_file(address)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
 async fn delete_local_private_file(address: String) -> Result<(), CommandError> {
     ant::local_storage::delete_local_private_file(address)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
 async fn delete_local_public_archive(address: String) -> Result<(), CommandError> {
     ant::local_storage::delete_local_public_archive(address)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]
 async fn delete_local_private_archive(address: String) -> Result<(), CommandError> {
     ant::local_storage::delete_local_private_archive(address)
         .await
-        .map_err(|err| CommandError {
-            message: err.to_string(),
-        })
+        .map_err(CommandError::from_err)
 }
 
 #[tauri::command]

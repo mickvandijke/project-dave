@@ -8,6 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const PAYMENT_EXPIRATION_SECS: u64 = 3600 * 24 * 30; // 30 days
 
+/// Returns the current Unix timestamp in seconds.
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedPayment {
     pub receipt: Receipt,
@@ -28,10 +36,7 @@ impl PaymentCache {
 
     pub fn save_payment(&self, file_path: &Path, receipt: &Receipt) -> Result<(), std::io::Error> {
         let file_hash = Self::compute_file_hash(file_path)?;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let timestamp = current_timestamp();
 
         let cached_payment = CachedPayment {
             receipt: receipt.clone(),
@@ -64,10 +69,7 @@ impl PaymentCache {
             if let Ok(contents) = fs::read_to_string(&path) {
                 if let Ok(cached_payment) = serde_json::from_str::<CachedPayment>(&contents) {
                     if cached_payment.file_hash == target_hash {
-                        let current_time = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
+                        let current_time = current_timestamp();
 
                         if current_time - cached_payment.timestamp < PAYMENT_EXPIRATION_SECS {
                             return Ok(Some(cached_payment.receipt));
@@ -81,10 +83,7 @@ impl PaymentCache {
     }
 
     pub fn cleanup_outdated_payments(&self) -> Result<(), std::io::Error> {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let current_time = current_timestamp();
 
         for entry in fs::read_dir(&self.cache_dir)? {
             let entry = entry?;
@@ -113,10 +112,7 @@ impl PaymentCache {
     
     pub fn save_archive_payment(&self, files: &[crate::ant::files::File], archive_name: &str, receipt: &Receipt) -> Result<(), std::io::Error> {
         let archive_hash = Self::compute_archive_hash(files, archive_name)?;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let timestamp = current_timestamp();
 
         let cached_payment = CachedPayment {
             receipt: receipt.clone(),
@@ -128,7 +124,7 @@ impl PaymentCache {
         let cache_path = self.cache_dir.join(cache_filename);
 
         let json = serde_json::to_string_pretty(&cached_payment)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         fs::write(cache_path, json)?;
 
         Ok(())
@@ -148,10 +144,7 @@ impl PaymentCache {
                     if let Ok(contents) = fs::read_to_string(&path) {
                         if let Ok(cached_payment) = serde_json::from_str::<CachedPayment>(&contents) {
                             if cached_payment.file_hash == target_hash {
-                                let current_time = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0);
+                                let current_time = current_timestamp();
 
                                 if current_time - cached_payment.timestamp < PAYMENT_EXPIRATION_SECS {
                                     return Ok(Some(cached_payment.receipt));
