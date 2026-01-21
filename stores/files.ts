@@ -1,16 +1,18 @@
 import {invoke} from "@tauri-apps/api/core";
 import type {IFolder, IFile, IVaultStructure, IArchive, IFailedArchive, IFileMetadata} from "~/types/folder";
 import {useWalletStore} from "~/stores/wallet";
+import { Folder } from "~/models/Folder";
+import { getAddressKey } from "~/utils/archive";
+import { generateTempCode } from "~/utils/archive";
+import { buildRootDirectory, type BuildableArchive, type BuildableFile } from "~/composables/useDirectoryBuilder";
 
 export const useFileStore = defineStore("files", () => {
     const walletStore = useWalletStore();
-    // const autonomi = useAutonomiStore();
     const toast = useToast();
 
-    // Simple helper functions for address tracking
-    const getAddressKey = (address: string, isPrivate: boolean): string => {
-        return isPrivate ? `private:${address}` : `public:${address}`;
-    };
+    // Archive loading state using simple refs (shared pattern from useArchiveLoading)
+    const loadingArchiveAddresses = ref<Set<string>>(new Set());
+    const loadingArchiveNames = ref<Map<string, string>>(new Map());
 
     const addLoadingArchive = (name: string, address: string, isPrivate: boolean) => {
         const key = getAddressKey(address, isPrivate);
@@ -34,76 +36,10 @@ export const useFileStore = defineStore("files", () => {
         loadingArchiveNames.value.clear();
     };
 
-    // Class
-    class Folder {
-        name: string;
-        paths: any;
-        parent: any;
-        children: any[] = [];
-        isArchive: boolean = false;
-        archive?: IArchive;
-
-        constructor(name: string, parent = null, paths = null, isArchive = false, archive?: IArchive) {
-            this.name = name;
-            this.parent = parent;
-            this.isArchive = isArchive;
-            this.archive = archive;
-            // this.paths = paths;
-        }
-
-        // Add asubfolder
-        addSubfolder(subfolder: IFolder) {
-            try {
-                if (this.children.find((child) => child.name === subfolder.name)) {
-                    throw new Error("Subfolder already exists");
-                }
-
-                // Create subfolder
-                subfolder.parent = this;
-                this.children.push(subfolder);
-            } catch (error) {
-                console.log(">>> ERROR: Failed to add subfolder", error);
-                // TODO: Message error creating sub folder
-            }
-        }
-
-        // Add file
-        addFile(file: any) {
-            try {
-                const existingFile = this.children.find((child) => child.name === file.name);
-                if (existingFile) {
-                    // Update existing file if new one has more data
-                    if (file.is_loaded && !existingFile.is_loaded) {
-                        Object.assign(existingFile, file);
-                    }
-                    return;
-                }
-
-                // Create file
-                file.parent = this;
-                this.children.push(file);
-            } catch (error) {
-                console.log(">>> ERROR: Failed to add file", error);
-            }
-        }
-
-        // Go up to parent folder
-        getParent() {
-            return this.parent;
-        }
-
-        // Gets child (subfolder or file) by name
-        getChild(name: string) {
-            return this.children.find((child) => child.name === name);
-        }
-    }
-
     // State
     const files = ref<IFile[]>([]);
     const vaultStructure = ref<IVaultStructure | null>(null);
     const failedArchives = ref<IFailedArchive[]>([]);
-    const loadingArchiveAddresses = ref<Set<string>>(new Set());
-    const loadingArchiveNames = ref<Map<string, string>>(new Map()); // address -> name
     const rootDirectory = ref<IFolder | null>(null);
     const currentDirectory = ref<IFolder | null>(null);
     const pendingVaultStructure = ref(false);
@@ -130,7 +66,51 @@ export const useFileStore = defineStore("files", () => {
     });
 
     // Actions
-    const buildRootDirectory = () => {
+    const rebuildRootDirectory = () => {
+        try {
+            // Reset rootDirectory
+            rootDirectory.value = null;
+
+            if (!vaultStructure.value?.archives.length && !vaultStructure.value?.files?.length) {
+                return;
+            }
+
+            // Use shared directory builder
+            const archives = vaultStructure.value.archives.map((archive: IArchive) => ({
+                name: archive.name,
+                archive_access: archive.archive_access,
+                files: archive.files.map((file: IFileMetadata) => ({
+                    path: file.path,
+                    metadata: file.metadata,
+                    access_data: file.access_data,
+                    file_type: file.file_type,
+                    is_loaded: file.is_loaded
+                }))
+            })) as BuildableArchive[];
+
+            const individualFiles = (vaultStructure.value.files || []).map((file: IFileMetadata) => ({
+                path: file.path,
+                metadata: file.metadata,
+                access_data: file.access_data,
+                file_type: file.file_type,
+                is_loaded: file.is_loaded
+            })) as BuildableFile[];
+
+            rootDirectory.value = buildRootDirectory(archives, individualFiles, {
+                rootName: 'Vault',
+                accessDataField: 'access_data'
+            });
+
+            // Set current directory
+            currentDirectory.value = rootDirectory.value;
+        } catch (error) {
+            console.log(">>> ERROR: Failed to build archive-based local vault", error);
+            rootDirectory.value = null;
+        }
+    };
+
+    // Legacy alias for buildRootDirectory
+    const buildRootDirectoryLegacy = () => {
         try {
             // Reset rootDirectory
             rootDirectory.value = null;
@@ -150,7 +130,7 @@ export const useFileStore = defineStore("files", () => {
                     // Unnamed archive - add files directly to root
                     archive.files.forEach((file: IFileMetadata) => {
                         const fileParts = file.path.split("/").filter(part => part.length > 0);
-                        let current: any = rootDirectory.value;
+                        let current: Folder = rootDirectory.value!;
 
                         fileParts.forEach((part: string, index: number) => {
                             if (index === fileParts.length - 1) {
@@ -165,11 +145,12 @@ export const useFileStore = defineStore("files", () => {
                                     load_error: false,
                                     name: part,
                                     archive_name: archive.name || `archive_${archiveIndex}`,
-                                    archive_access: archive.archive_access
+                                    archive_access: archive.archive_access,
+                                    parent: null
                                 });
                             } else {
                                 // This is a subdirectory - create regular folder (not archive folder)
-                                let subFolder = current.getChild(part);
+                                let subFolder = current.getSubfolder(part);
                                 if (!subFolder) {
                                     subFolder = new Folder(part, current);
                                     current.addSubfolder(subFolder);
@@ -187,12 +168,12 @@ export const useFileStore = defineStore("files", () => {
                     while (rootDirectory.value!.getChild(archiveFolderName)) {
                         const existingChild = rootDirectory.value!.getChild(archiveFolderName);
                         // If it's the same archive (same address), don't create a duplicate
-                        if (existingChild && existingChild.archive) {
-                            const existingAddress = 'Private' in existingChild.archive.archive_access 
-                                ? existingChild.archive.archive_access.Private 
+                        if (existingChild && existingChild instanceof Folder && existingChild.archive) {
+                            const existingAddress = 'Private' in existingChild.archive.archive_access
+                                ? existingChild.archive.archive_access.Private
                                 : existingChild.archive.archive_access.Public;
-                            const currentAddress = 'Private' in archive.archive_access 
-                                ? archive.archive_access.Private 
+                            const currentAddress = 'Private' in archive.archive_access
+                                ? archive.archive_access.Private
                                 : archive.archive_access.Public;
                             if (existingAddress === currentAddress) {
                                 // Same archive, don't add counter - just skip creating a new folder
@@ -209,7 +190,7 @@ export const useFileStore = defineStore("files", () => {
                     // Add files within the archive folder
                     archive.files.forEach((file: IFileMetadata) => {
                         const fileParts = file.path.split("/").filter(part => part.length > 0);
-                        let current: any = archiveFolder;
+                        let current: Folder = archiveFolder;
 
                         fileParts.forEach((part: string, index: number) => {
                             if (index === fileParts.length - 1) {
@@ -224,12 +205,13 @@ export const useFileStore = defineStore("files", () => {
                                     load_error: false,
                                     name: part,
                                     archive_name: archive.name,
-                                    archive_access: archive.archive_access
+                                    archive_access: archive.archive_access,
+                                    parent: null
                                 });
                             } else {
                                 // This is a subdirectory within the archive
                                 // Allow duplicate directory names within different archives by not checking globally
-                                let subFolder = current.getChild(part);
+                                let subFolder = current.getSubfolder(part);
                                 if (!subFolder) {
                                     subFolder = new Folder(part, current);
                                     current.addSubfolder(subFolder);
@@ -244,7 +226,7 @@ export const useFileStore = defineStore("files", () => {
             // Process individual files (not in archives)
             vaultStructure.value?.files?.forEach((file: IFileMetadata) => {
                 const fileParts = file.path.split("/").filter(part => part.length > 0);
-                let current: any = rootDirectory.value;
+                let current: Folder = rootDirectory.value!;
 
                 fileParts.forEach((part: string, index: number) => {
                     if (index === fileParts.length - 1) {
@@ -258,11 +240,12 @@ export const useFileStore = defineStore("files", () => {
                             is_loading: false,
                             load_error: false,
                             name: part,
-                            archive_name: "" // Individual files have no archive
+                            archive_name: "", // Individual files have no archive
+                            parent: null
                         });
                     } else {
                         // This is a subdirectory - create regular folder (not archive folder)
-                        let subFolder = current.getChild(part);
+                        let subFolder = current.getSubfolder(part);
                         if (!subFolder) {
                             subFolder = new Folder(part, current);
                             current.addSubfolder(subFolder);
@@ -293,15 +276,15 @@ export const useFileStore = defineStore("files", () => {
     };
 
     // Generate a unique temp code for this load operation
-    const generateTempCode = () => {
-        return `vault_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const localGenerateTempCode = () => {
+        return generateTempCode('vault');
     };
 
     const getVaultStructure = async () => {
         console.log(">>> Getting vault structure with streaming...");
 
         // Generate new temp code for this load operation
-        const tempCode = generateTempCode();
+        const tempCode = localGenerateTempCode();
         currentLoadCode.value = tempCode;
         console.log(">>> Generated temp code for vault load:", tempCode);
 
@@ -383,7 +366,7 @@ export const useFileStore = defineStore("files", () => {
                 });
 
                 // Build initial directory structure with individual files
-                buildRootDirectory();
+                buildRootDirectoryLegacy();
 
                 // Hide loading once we have some content
                 if (update.files.length > 0) {
@@ -429,7 +412,7 @@ export const useFileStore = defineStore("files", () => {
                     });
 
                     // Rebuild directory structure to include new archive
-                    buildRootDirectory();
+                    buildRootDirectoryLegacy();
 
                     // Hide loading once we have some content
                     if (files.value.length > 0) {
@@ -462,7 +445,7 @@ export const useFileStore = defineStore("files", () => {
                     }
 
                     // Rebuild directory to show failed archives
-                    buildRootDirectory();
+                    buildRootDirectoryLegacy();
                 }
                 break;
 

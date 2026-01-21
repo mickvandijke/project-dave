@@ -1,35 +1,39 @@
 <script lang="ts" setup>
-// import { useToast } from "primevue/usetoast";
-// import { useWalletStore } from "~/stores/wallet";
-// import { storeToRefs } from "pinia";
-// Login
+import { useDialogNotification } from "~/stores/notifications";
+
+// Support both store-based and prop-based usage for backwards compatibility
 const props = defineProps<{
-  visible: boolean;
-  notifyType: 'info' | 'warning';
-  title: string;
-  details: string;
+  visible?: boolean;
+  notifyType?: 'info' | 'warning';
+  title?: string;
+  details?: string;
   canCancel?: boolean;
 }>();
 
 const emit = defineEmits(["close-notify"]);
-// const toast = useToast();
-// const walletStore = useWalletStore();
-// const { pendingDisconnectWallet, wallet } = storeToRefs(walletStore);
 
-const {visible} = props;
+// Get notification store
+const notification = useDialogNotification();
 
-// const handleCancelDisconnect = () => {
-//   emit("close-disconnect-wallet");
-// };
+// Computed values that prefer props over store (for backwards compatibility)
+const isVisible = computed(() => props.visible ?? notification.isVisible.value);
+const currentTitle = computed(() => props.title ?? notification.title.value);
+const currentDetails = computed(() => props.details ?? notification.details.value);
+const currentCanCancel = computed(() => props.canCancel ?? notification.canCancel.value);
 
 const handleCancelNotify = () => {
-  emit("close-notify");
+  // If using props, emit event
+  if (props.visible !== undefined) {
+    emit("close-notify");
+  }
+  // If using store, call store's cancel
+  notification.cancel();
 };
 </script>
 
 <template>
   <Dialog
-      :visible="props.visible"
+      :visible="isVisible"
       pt:root:class="!border-0 !bg-transparent"
       pt:mask:class="backdrop-blur-sm"
       position="topright"
@@ -43,15 +47,15 @@ const handleCancelNotify = () => {
         </div>
 
         <div class="mt-6 text-white font-semibold flex items-center gap-2">
-          <i class="pi pi-spin pi-spinner text-autonomi-red-300"/>{{ title }}
+          <i class="pi pi-spin pi-spinner text-autonomi-red-300"/>{{ currentTitle }}
         </div>
         <div
             class="flex items-center justify-center gap-4 text-autonomi-text-primary mt-2"
         >
-          <span>{{ details }}</span>
+          <span>{{ currentDetails }}</span>
         </div>
 
-        <div v-if="props.canCancel" class="mt-4">
+        <div v-if="currentCanCancel" class="mt-4">
           <CommonButton
               variant="secondary"
               size="small"

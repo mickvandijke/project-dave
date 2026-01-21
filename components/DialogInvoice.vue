@@ -2,28 +2,9 @@
 import {usePaymentStore} from "~/stores/payments";
 import {storeToRefs} from "pinia";
 import {invoke} from "@tauri-apps/api/core";
-
-interface UploadStep {
-  key: string;
-  label: string;
-  status: 'pending' | 'processing' | 'completed' | 'error';
-  message?: string;
-  progress?: number;
-}
-
-interface QuoteData {
-  totalFiles: number;
-  totalSize: string;
-  totalCostFormatted?: string;
-  pricePerMB?: string;
-  paymentRequired?: boolean;
-  paymentOrderId?: string;
-  totalCostNano?: string;
-  costPerFileNano?: string;
-  payments?: any[];
-  rawPayments?: any[];
-  rawQuoteData?: any;
-}
+import { formatANT, formatBytes } from "~/utils/formatting";
+import { useCountdown } from "~/composables/useCountdown";
+import type { UploadStep, QuoteData } from "~/types/folder";
 
 const props = defineProps<{
   visible: boolean;
@@ -157,77 +138,15 @@ const totalPaymentAmount = computed(() => {
   return props.quoteData?.totalCostNano || '0';
 });
 
-const formatBytes = (bytes: number): string => {
-  if (bytes === 0) return "0 Bytes";
-  const k = 1024;
-  const sizes = ["Bytes", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
-};
+// formatBytes and formatANT are now imported from ~/utils/formatting
 
-const formatANT = (attoAmount: string): string => {
-  try {
-    // Convert string to BigInt
-    const atto = BigInt(attoAmount);
-
-    // 1 ANT = 10^18 ATTO
-    const ATTO_PER_ANT = BigInt(1_000_000_000_000_000_000n);
-
-    // Divide to get ANT amount
-    const antAmount = atto / ATTO_PER_ANT;
-    const remainder = atto % ATTO_PER_ANT;
-
-    // Format with decimal places if there's a remainder
-    if (remainder === BigInt(0)) {
-      return antAmount.toString();
-    } else {
-      // Calculate decimal places (up to 18 decimals)
-      const decimalStr = remainder.toString().padStart(18, '0');
-      // Remove trailing zeros
-      const trimmed = decimalStr.replace(/0+$/, '');
-      if (trimmed.length === 0) {
-        return antAmount.toString();
-      }
-      // Show more decimal places - up to 12 for better precision
-      const displayDecimals = trimmed.substring(0, 12);
-      return `${antAmount}.${displayDecimals}`;
-    }
-  } catch (error) {
-    console.error('Error formatting ANT amount:', error);
-    return '0';
-  }
-};
-
-// Timer for payment expiration
-const remainingTime = ref("00:00:00");
-let interval: any;
-
-const startCountdown = () => {
-  if (currentPayment.value) {
-    remainingTime.value = paymentStore.calculateRemainingTime(currentPayment.value.expires);
-
-    interval = setInterval(() => {
-      if (currentPayment.value) {
-        const time = paymentStore.calculateRemainingTime(currentPayment.value.expires);
-        remainingTime.value = time;
-
-        if (time === "00:00:00") {
-          clearInterval(interval);
-        }
-      }
-    }, 1000);
-  }
-};
+// Timer for payment expiration using useCountdown composable
+const countdown = useCountdown();
+const remainingTime = countdown.remainingTime;
 
 watchEffect(() => {
   if (currentPayment.value && props.currentStep === 'payment-request') {
-    startCountdown();
-  }
-});
-
-onUnmounted(() => {
-  if (interval) {
-    clearInterval(interval);
+    countdown.start(currentPayment.value.expires);
   }
 });
 

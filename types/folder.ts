@@ -64,20 +64,67 @@ export interface IFile {
   load_error?: boolean;
 }
 
-/*
- DEV Sample of IFile
-{
-  file_access: {Private: BYTES ARRAY} or {Public: "data_address_string"}
-  metadata: {uploaded: 1734804991, created: 1734804991, modified: 1734804991, size: 4357964}
-  path: "/ant.log"
+/**
+ * Upload progress step status
+ */
+export type UploadStepStatus = 'pending' | 'processing' | 'completed' | 'error';
+
+/**
+ * Upload progress step for tracking multi-stage uploads
+ */
+export interface UploadStep {
+  key: string;
+  label: string;
+  status: UploadStepStatus;
+  message?: string;
+  progress?: number;
 }
-*/
-export interface IFileOLD {
-  // TODO: DELETE THIS IF NOT USED
-  paths: {
-    local: string;
-    network: string;
-  };
-  size: number;
-  paprint: IFolder;
+
+/**
+ * Quote data received from the network for an upload
+ */
+export interface QuoteData {
+  totalFiles: number;
+  totalSize: string;
+  totalCostFormatted?: string;
+  pricePerMB?: string;
+  paymentRequired?: boolean;
+  paymentOrderId?: string;
+  totalCostNano?: string;
+  costPerFileNano?: string;
+  payments?: PaymentInfo[];
+  rawPayments?: [string, string, string][];  // [quoteHash, rewardsAddress, amount]
+  rawQuoteData?: unknown;
 }
+
+/**
+ * Payment info for a single quote payment
+ */
+export interface PaymentInfo {
+  quoteHash: string;
+  rewardsAddress: string;
+  amount: string;
+}
+
+/**
+ * Options for file upload
+ */
+export interface UploadOptionsData {
+  makePublic: boolean;
+  existingArchiveAddress?: string;
+}
+
+/**
+ * File type for access control
+ */
+export type FileAccessType = 'public_file' | 'private_file';
+
+/**
+ * Archive access structure for private or public archives
+ */
+export type ArchiveAccess = { Private: string } | { Public: string };
+
+/**
+ * File access structure - Private contains bytes, Public contains address string
+ */
+export type FileAccessData = { Private: number[] } | { Public: string };

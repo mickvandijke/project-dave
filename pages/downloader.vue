@@ -4,10 +4,13 @@ import {invoke} from "@tauri-apps/api/core";
 import {useToast} from "primevue/usetoast";
 import {useWalletStore} from "~/stores/wallet";
 import {storeToRefs} from "pinia";
+import { detectHexType, cleanHex, hexToBytes } from "~/utils/hex";
+import { useNotifications } from "~/composables/useNotifications";
 
 const emit = defineEmits(["show-notify", "hide-notify"]);
 
 const toast = useToast();
+const { showSuccess, showError, showInfo } = useNotifications();
 const walletStore = useWalletStore();
 const {wallet} = storeToRefs(walletStore);
 
@@ -17,29 +20,8 @@ const isDownloading = ref(false);
 const downloadedFile = ref<{ path: string; fileName: string; inputType: string; originalInput: string } | null>(null);
 const isAddingToVault = ref(false);
 
-const inputType = computed(() => {
-  const trimmed = inputValue.value.trim();
-  if (!trimmed) return null;
-
-  // Remove 0x prefix if present for validation
-  const cleanHex = trimmed.toLowerCase().startsWith("0x") ? trimmed.substring(2) : trimmed;
-
-  // Check if it's a valid hex string (case insensitive)
-  if (!/^[0-9a-fA-F]+$/i.test(cleanHex)) {
-    return null;
-  }
-
-  // Data address is exactly 64 hex characters
-  if (cleanHex.length === 64) {
-    return "address";
-  }
-  // Data map hex is typically longer than 64 characters
-  else if (cleanHex.length > 64) {
-    return "datamap";
-  }
-
-  return null;
-});
+// Use hex utility to detect input type
+const inputType = computed(() => detectHexType(inputValue.value));
 
 const isValidInput = computed(() => inputType.value !== null && customFileName.value.trim() !== "");
 
@@ -82,26 +64,14 @@ const downloadFile = async () => {
     });
 
     if (inputType.value === "address") {
-      let address = inputValue.value.trim();
-      // Remove 0x prefix if present for addresses too
-      if (address.startsWith("0x")) {
-        address = address.substring(2);
-      }
+      const address = cleanHex(inputValue.value);
 
       await invoke("download_public_file", {
         addr: address,
         toDest: destinationPath
       });
     } else if (inputType.value === "datamap") {
-      let dataMapHex = inputValue.value.trim();
-      if (dataMapHex.startsWith("0x")) {
-        dataMapHex = dataMapHex.substring(2);
-      }
-
-      const dataMapBytes = Array.from(
-          dataMapHex.match(/.{1,2}/g) || [],
-          byte => parseInt(byte, 16)
-      );
+      const dataMapBytes = hexToBytes(inputValue.value);
 
       await invoke("download_private_file", {
         dataMapChunk: dataMapBytes,
@@ -173,24 +143,12 @@ const addDirectlyToVault = async () => {
       enabledCancel: false
     });
 
-    // Determine the file access type
+    // Determine the file access type using hex utilities
     let fileAccess;
     if (inputType.value === "address") {
-      let address = inputValue.value.trim();
-      if (address.startsWith("0x")) {
-        address = address.substring(2);
-      }
-      fileAccess = {Public: address};
+      fileAccess = {Public: cleanHex(inputValue.value)};
     } else {
-      let dataMapHex = inputValue.value.trim();
-      if (dataMapHex.startsWith("0x")) {
-        dataMapHex = dataMapHex.substring(2);
-      }
-      const dataMapBytes = Array.from(
-          dataMapHex.match(/.{1,2}/g) || [],
-          byte => parseInt(byte, 16)
-      );
-      fileAccess = {Private: dataMapBytes};
+      fileAccess = {Private: hexToBytes(inputValue.value)};
     }
 
     // Add the file to vault using the new analysis-based Tauri command
