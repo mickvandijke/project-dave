@@ -53,10 +53,6 @@ pub fn get_payment_cache() -> Result<&'static PaymentCache, &'static str> {
         .map_err(|_| "Payment cache not available")
 }
 
-// ============================================================================
-// Helper Functions - Phase 1
-// ============================================================================
-
 use autonomi::client::quote::StoreQuote;
 use autonomi::Client;
 use super::payments::Payment;
@@ -171,10 +167,6 @@ async fn get_or_create_user_data(
         }
     }
 }
-
-// ============================================================================
-// Helper Functions - Phase 2
-// ============================================================================
 
 /// Result of checking cached payment for a file or archive.
 #[derive(Default)]
@@ -360,10 +352,6 @@ async fn prepare_vault_update(
         },
     })
 }
-
-// ============================================================================
-// Helper Functions - Phase 3
-// ============================================================================
 
 /// Emits an upload progress event.
 fn emit_upload_progress(app: &AppHandle, progress: UploadProgress) -> Result<(), UploadError> {
@@ -590,10 +578,6 @@ pub async fn collect_files_from_directory(
     Ok(files)
 }
 
-// ============================================================================
-// Upload Parameter Structs
-// ============================================================================
-
 /// Common options for starting an upload operation.
 pub struct StartUploadOptions {
     pub upload_id: String,
@@ -610,10 +594,6 @@ pub struct ExecuteUploadContext {
     pub vault_update: vault::VaultUpdate,
     pub vault_secret_key: Option<VaultSecretKey>,
 }
-
-// ============================================================================
-// Upload Functions
-// ============================================================================
 
 pub async fn start_private_single_file_upload(
     app: AppHandle,
