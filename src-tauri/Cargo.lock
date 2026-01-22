@@ -807,8 +807,6 @@ dependencies = [
 [[package]]
 name = "ant-bootstrap"
 version = "0.2.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35415325ba6f85951d1904dabfe47fffd2107ac28a1178c42f7fbd328d37ecb6"
 dependencies = [
  "ant-logging",
  "ant-protocol",
@@ -832,8 +830,6 @@ dependencies = [
 [[package]]
 name = "ant-build-info"
 version = "0.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b6954a9d1c42c19ff90fd59ace0e89e966b06d901d45a5a7f0e66a37b083e2b"
 dependencies = [
  "chrono",
  "tracing",
@@ -843,8 +839,6 @@ dependencies = [
 [[package]]
 name = "ant-evm"
 version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56d5be195b2efaa11718d381124785e6a67438fef4ea52ab0d2b556e62e64656"
 dependencies = [
  "ant-merkle",
  "custom_debug",
@@ -866,8 +860,6 @@ dependencies = [
 [[package]]
 name = "ant-logging"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2efdf98eb19e81959464b67c68e57a061124bbb743443bf3364616ab60c922c7"
 dependencies = [
  "chrono",
  "dirs-next",
@@ -893,8 +885,6 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "1.0.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d83e1939421c099a3ae30aeeee03501ed79f20d9fd5fd55bdcf2f2f6499f82e5"
 dependencies = [
  "ant-build-info",
  "ant-evm",
@@ -1437,8 +1427,6 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 [[package]]
 name = "autonomi"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "120f9b3fe2fe160eee873d1788e9d43ff65c9a7b83454315cc8b1551ecf8a4b2"
 dependencies = [
  "ant-bootstrap",
  "ant-evm",
@@ -3050,8 +3038,6 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.4.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12ed64e8a3d5c9b6cb3a630053779cd4eaa749a1663229806fb7e2cf6a308987"
 dependencies = [
  "alloy",
  "exponential-backoff",

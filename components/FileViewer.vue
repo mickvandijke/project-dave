@@ -233,8 +233,10 @@ const handleCloseUploadModal = () => {
 };
 
 const handlePayUpload = async () => {
+  // Check if this is a merkle payment
+  const isMerklePayment = quoteData.value?.isMerklePayment === true;
 
-  if (!quoteData.value?.payments || quoteData.value.payments.length === 0) {
+  if (!isMerklePayment && (!quoteData.value?.payments || quoteData.value.payments.length === 0)) {
     console.error("No payments data available - might be free upload");
 
     // If it's a free upload (no payments required), proceed directly
@@ -293,34 +295,40 @@ const handlePayUpload = async () => {
     emit("show-notify", {
       notifyType: "info",
       title: "Payment required",
-      details: "Please approve the payment in your mobile wallet.",
+      details: isMerklePayment
+        ? "Please approve the merkle tree payment in your wallet."
+        : "Please approve the payment in your mobile wallet.",
     });
 
-    // Process payment through wallet
+    if (isMerklePayment && modalUploadId.value) {
+      // Handle merkle payment flow
+      console.log("Processing merkle payment for upload:", modalUploadId.value);
+      await paymentStore.payMerkle(modalUploadId.value);
+    } else {
+      // Handle standard payment flow
+      // Use rawPayments if available, otherwise fall back to payments
+      const quotes = quoteData.value.rawPayments;
+      const txHashes = await walletStore.payForQuotes(quotes);
 
-    // Use rawPayments if available, otherwise fall back to payments
-    const quotes = quoteData.value.rawPayments;
-    const txHashes = await walletStore.payForQuotes(quotes);
+      // Confirm payment with backend to trigger upload execution
+      if (modalUploadId.value) {
+        try {
+          await invoke("confirm_upload_payment", {
+            uploadId: modalUploadId.value // Use the same ID throughout!
+          });
+        } catch (error) {
+          console.error("Failed to confirm payment with backend:", error);
+          updateStepStatus('payment-request', 'error', 'Failed to start upload');
+          return;
+        }
+      }
+    }
 
     // Hide wallet payment notification
     emit("hide-notify");
 
     // Update UI to show wallet payment successful
     updateStepStatus('payment-request', 'completed', 'Payment confirmed');
-
-
-    // Confirm payment with backend to trigger upload execution
-    if (modalUploadId.value) {
-      try {
-        await invoke("confirm_upload_payment", {
-          uploadId: modalUploadId.value // Use the same ID throughout!
-        });
-      } catch (error) {
-        console.error("Failed to confirm payment with backend:", error);
-        updateStepStatus('payment-request', 'error', 'Failed to start upload');
-        return;
-      }
-    }
 
     // Don't manually update upload status - wait for backend Started/Uploading events
     if (modalUploadId.value) {
@@ -2045,6 +2053,47 @@ const setupEventListeners = async () => {
         activeTab.value = 2;
 
       }
+    }
+  });
+
+  // Set up merkle payment quote event listener
+  await listen("merkle-payment-quote", async (event: any) => {
+    const payload = event.payload;
+    console.log(">>> Received merkle-payment-quote event:", payload);
+
+    // Find the upload by ID
+    const upload = uploadsStore.uploads.find(u => u.id === payload.upload_id);
+    const isModalUpload = upload && modalUploadId.value === upload.id;
+
+    if (!upload) {
+      console.warn(">>> Upload not found for merkle quote:", payload.upload_id);
+      return;
+    }
+
+    // Add the merkle payment to the payment store
+    paymentStore.addPendingMerklePayment(payload);
+
+    // Handle modal uploads (with UI)
+    if (isModalUpload && showUploadModal.value) {
+      // Update UI to show merkle quote received
+      updateStepStatus('quoting', 'completed', 'Merkle quote received');
+      updateStepStatus('payment-request', 'pending', 'Ready for merkle payment...');
+
+      // Store quote data for display
+      quoteData.value = {
+        totalFiles: payload.total_files,
+        totalSize: formatBytes(payload.total_size || 0),
+        totalCostFormatted: `${payload.estimated_cost} ATTO`,
+        totalCostNano: payload.estimated_cost,
+        paymentRequired: true,
+        isMerklePayment: true,
+        payments: [],
+        rawPayments: [],
+        files: pendingUploadFiles.value?.files,
+        archiveName: pendingUploadFiles.value?.files?.[0]?.name || "",
+        vaultKeySignature: pendingUploadFiles.value?.vaultKeySignature,
+        isFolder: pendingUploadFiles.value?.isFolder
+      };
     }
   });
 

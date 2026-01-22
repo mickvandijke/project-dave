@@ -1,6 +1,7 @@
 //! Error types for file operations.
 
 use autonomi::client::GetError;
+use autonomi::client::merkle_payments::MerklePaymentError;
 use autonomi::vault::user_data::UserDataVaultError;
 use std::path::PathBuf;
 use thiserror::Error as ThisError;
@@ -24,6 +25,8 @@ pub enum UploadError {
     Serialization(String),
     #[error("Failed to put data: {0}")]
     Put(String),
+    #[error("Merkle payment preparation failed: {0}")]
+    MerklePayment(#[from] MerklePaymentError),
 }
 
 /// Errors that can occur during vault operations.

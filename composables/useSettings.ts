@@ -9,6 +9,7 @@ import type { AppData } from './useTauriCommand';
 export interface Settings {
   downloadPath: string;
   usePaymaster: boolean;
+  useMerklePayments: boolean;
 }
 
 /**
@@ -19,6 +20,7 @@ export function useSettings() {
   // State
   const downloadPath = ref<string>('');
   const usePaymaster = ref<boolean>(false);
+  const useMerklePayments = ref<boolean>(false);
   const appVersion = ref<string>('');
   const isLoading = ref<boolean>(false);
   const isSaving = ref<boolean>(false);
@@ -35,6 +37,7 @@ export function useSettings() {
       const appData = await invoke<AppData>('app_data');
       downloadPath.value = appData.download_path || '';
       usePaymaster.value = appData.use_paymaster ?? false;
+      useMerklePayments.value = appData.use_merkle_payments ?? false;
     } catch (err) {
       console.error('Failed to load settings:', err);
       error.value = 'Failed to load settings';
@@ -153,6 +156,30 @@ export function useSettings() {
   };
 
   /**
+   * Update the merkle payments setting
+   * @param enabled - Whether to enable merkle payments
+   */
+  const setUseMerklePayments = async (enabled: boolean): Promise<void> => {
+    const previousValue = useMerklePayments.value;
+    useMerklePayments.value = enabled;
+
+    try {
+      await saveSetting('use_merkle_payments', enabled);
+    } catch (err) {
+      // Revert on error
+      useMerklePayments.value = previousValue;
+      throw err;
+    }
+  };
+
+  /**
+   * Toggle the merkle payments setting
+   */
+  const toggleMerklePayments = async (): Promise<void> => {
+    await setUseMerklePayments(!useMerklePayments.value);
+  };
+
+  /**
    * Open the logs folder in the system file manager
    */
   const openLogsFolder = async (): Promise<void> => {
@@ -189,6 +216,7 @@ export function useSettings() {
     // State
     downloadPath: readonly(downloadPath),
     usePaymaster: readonly(usePaymaster),
+    useMerklePayments: readonly(useMerklePayments),
     appVersion: readonly(appVersion),
     isLoading: readonly(isLoading),
     isSaving: readonly(isSaving),
@@ -201,6 +229,8 @@ export function useSettings() {
     chooseDownloadDirectory,
     setUsePaymaster,
     togglePaymaster,
+    setUseMerklePayments,
+    toggleMerklePayments,
     openLogsFolder,
     getDownloadPath,
     isPaymasterEnabled

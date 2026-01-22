@@ -140,5 +140,6 @@ export const tauriCommands = {
 export interface AppData {
   download_path?: string;
   use_paymaster?: boolean;
+  use_merkle_payments?: boolean;
   [key: string]: unknown;
 }

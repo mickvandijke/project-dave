@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use crate::ant::client::SharedClient;
-use crate::ant::files::{ExecuteUploadContext, File, FileAccess, StartUploadOptions};
+use crate::ant::files::{ExecuteMerkleUploadContext, ExecuteUploadContext, File, FileAccess, StartUploadOptions};
+use crate::ant::merkle_payments::MerklePaymentResult;
 use crate::ant::payments::{OrderID, OrderMessage, PaymentOrderManager};
 use crate::ant::vault::{parse_vault_key, VaultUpdate};
 use ant::{
@@ -9,12 +10,15 @@ use ant::{
     files::{FileFromVault, VaultStructure},
     local_storage::LocalFileData,
 };
+use autonomi::AttoTokens;
 use autonomi::chunk::DataMapChunk;
 use autonomi::client::data::DataAddress;
+use autonomi::client::merkle_payments::PreparedMerklePayment;
 use autonomi::client::payment::Receipt;
 use autonomi::client::quote::StoreQuote;
 use autonomi::client::vault::VaultSecretKey;
 use autonomi::files::{PrivateArchive, PublicArchive};
+use autonomi::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 // Removed unused rand import
@@ -64,6 +68,42 @@ pub enum PendingUploadData {
         add_to_vault: bool,
         vault_secret_key: Option<VaultSecretKey>,
         cached_receipt: Option<Receipt>,
+    },
+    // Merkle payment variants - use merkle tree payments instead of individual quote payments
+    SingleFileMerkle {
+        file: File,
+        datamap: DataMapChunk,
+        prepared_payment: PreparedMerklePayment,
+        vault_update: VaultUpdate,
+        secret_key: Option<VaultSecretKey>,
+        add_to_vault: bool,
+    },
+    SingleFileMerklePublic {
+        file: File,
+        datamap: DataMapChunk,
+        prepared_payment: PreparedMerklePayment,
+        vault_update: VaultUpdate,
+        add_to_vault: bool,
+        vault_secret_key: Option<VaultSecretKey>,
+    },
+    PrivateArchiveMerkle {
+        files: Vec<File>,
+        archive_name: String,
+        archive_datamap: DataMapChunk,
+        archive: PrivateArchive,
+        prepared_payment: PreparedMerklePayment,
+        vault_update: VaultUpdate,
+        add_to_vault: bool,
+        vault_secret_key: Option<VaultSecretKey>,
+    },
+    PublicArchiveMerkle {
+        files: Vec<File>,
+        archive_name: String,
+        archive: PublicArchive,
+        prepared_payment: PreparedMerklePayment,
+        vault_update: VaultUpdate,
+        add_to_vault: bool,
+        vault_secret_key: Option<VaultSecretKey>,
     },
 }
 
@@ -369,6 +409,18 @@ async fn confirm_upload_payment(
                 .await
                 .map_err(CommandError::from_err)?;
             }
+            // Merkle payment variants should not be confirmed via standard payment
+            PendingUploadData::SingleFileMerkle { .. }
+            | PendingUploadData::SingleFileMerklePublic { .. }
+            | PendingUploadData::PrivateArchiveMerkle { .. }
+            | PendingUploadData::PublicArchiveMerkle { .. } => {
+                return Err(CommandError {
+                    message: format!(
+                        "Upload {} is a merkle payment upload. Use confirm_merkle_upload_payment instead.",
+                        upload_id
+                    ),
+                });
+            }
         }
     } else {
         return Err(CommandError {
@@ -381,6 +433,193 @@ async fn confirm_upload_payment(
 
 // Cancel upload is only possible before payment - no backend command needed
 // Frontend handles cancellation by not proceeding to execute_upload
+
+#[tauri::command]
+async fn confirm_merkle_upload_payment(
+    app: AppHandle,
+    upload_id: String,
+    merkle_result: MerklePaymentResult,
+    shared_client: State<'_, SharedClient>,
+    pending_uploads: State<'_, PendingUploadsState>,
+) -> Result<(), CommandError> {
+    let mut pending = pending_uploads.lock().await;
+
+    if let Some(upload_data) = pending.take(&upload_id) {
+        // Parse winner_pool_hash from hex string
+        let winner_pool_hash_bytes = hex::decode(merkle_result.winner_pool_hash.trim_start_matches("0x"))
+            .map_err(|e| CommandError::from_err(format!("Invalid winner_pool_hash: {}", e)))?;
+
+        if winner_pool_hash_bytes.len() != 32 {
+            return Err(CommandError::from_err("winner_pool_hash must be 32 bytes"));
+        }
+
+        let winner_pool_hash: [u8; 32] = winner_pool_hash_bytes
+            .try_into()
+            .map_err(|_| CommandError::from_err("winner_pool_hash must be exactly 32 bytes"))?;
+
+        // Parse amount_paid from string (Amount is a 256-bit integer)
+        let amount: autonomi::Amount = merkle_result
+            .amount_paid
+            .parse()
+            .map_err(|e| CommandError::from_err(format!("Invalid amount_paid: {}", e)))?;
+        let amount_paid = AttoTokens::from_atto(amount);
+
+        info!(
+            "Processing merkle upload payment confirmation for upload_id: {}, winner_pool_hash: {:?}",
+            upload_id,
+            &merkle_result.winner_pool_hash[..10]
+        );
+
+        match upload_data {
+            PendingUploadData::SingleFileMerkle {
+                file,
+                datamap,
+                prepared_payment,
+                vault_update,
+                secret_key,
+                add_to_vault,
+            } => {
+                // Complete the merkle payment using the external signer API
+                let merkle_receipt = Client::complete_merkle_payment_external(
+                    prepared_payment,
+                    winner_pool_hash,
+                    amount_paid,
+                )
+                .map_err(|e| CommandError::from_err(format!("Failed to complete merkle payment: {}", e)))?;
+
+                ant::files::execute_private_single_file_upload_merkle(
+                    app,
+                    file,
+                    datamap,
+                    ExecuteMerkleUploadContext {
+                        upload_id,
+                        add_to_vault,
+                        merkle_receipt,
+                        vault_update,
+                        vault_secret_key: secret_key,
+                    },
+                    shared_client,
+                )
+                .await
+                .map_err(CommandError::from_err)?;
+            }
+            PendingUploadData::SingleFileMerklePublic {
+                file,
+                datamap,
+                prepared_payment,
+                vault_update,
+                add_to_vault,
+                vault_secret_key,
+            } => {
+                let merkle_receipt = Client::complete_merkle_payment_external(
+                    prepared_payment,
+                    winner_pool_hash,
+                    amount_paid,
+                )
+                .map_err(|e| CommandError::from_err(format!("Failed to complete merkle payment: {}", e)))?;
+
+                ant::files::execute_public_single_file_upload_merkle(
+                    app,
+                    file,
+                    datamap,
+                    ExecuteMerkleUploadContext {
+                        upload_id,
+                        add_to_vault,
+                        merkle_receipt,
+                        vault_update,
+                        vault_secret_key,
+                    },
+                    shared_client,
+                )
+                .await
+                .map_err(CommandError::from_err)?;
+            }
+            PendingUploadData::PrivateArchiveMerkle {
+                files,
+                archive_name,
+                archive_datamap,
+                archive,
+                prepared_payment,
+                vault_update,
+                add_to_vault,
+                vault_secret_key,
+            } => {
+                let merkle_receipt = Client::complete_merkle_payment_external(
+                    prepared_payment,
+                    winner_pool_hash,
+                    amount_paid,
+                )
+                .map_err(|e| CommandError::from_err(format!("Failed to complete merkle payment: {}", e)))?;
+
+                ant::files::execute_private_archive_upload_merkle(
+                    app,
+                    files,
+                    archive_name,
+                    archive_datamap,
+                    archive,
+                    ExecuteMerkleUploadContext {
+                        upload_id,
+                        add_to_vault,
+                        merkle_receipt,
+                        vault_update,
+                        vault_secret_key,
+                    },
+                    shared_client,
+                )
+                .await
+                .map_err(CommandError::from_err)?;
+            }
+            PendingUploadData::PublicArchiveMerkle {
+                files,
+                archive_name,
+                archive,
+                prepared_payment,
+                vault_update,
+                add_to_vault,
+                vault_secret_key,
+            } => {
+                let merkle_receipt = Client::complete_merkle_payment_external(
+                    prepared_payment,
+                    winner_pool_hash,
+                    amount_paid,
+                )
+                .map_err(|e| CommandError::from_err(format!("Failed to complete merkle payment: {}", e)))?;
+
+                ant::files::execute_public_archive_upload_merkle(
+                    app,
+                    files,
+                    archive_name,
+                    archive,
+                    ExecuteMerkleUploadContext {
+                        upload_id,
+                        add_to_vault,
+                        merkle_receipt,
+                        vault_update,
+                        vault_secret_key,
+                    },
+                    shared_client,
+                )
+                .await
+                .map_err(CommandError::from_err)?;
+            }
+            // Standard payment variants should not be confirmed via merkle
+            _ => {
+                return Err(CommandError {
+                    message: format!(
+                        "Upload {} is not a merkle payment upload. Use confirm_upload_payment instead.",
+                        upload_id
+                    ),
+                });
+            }
+        }
+    } else {
+        return Err(CommandError {
+            message: format!("Upload {} not found or already processed", upload_id),
+        });
+    }
+
+    Ok(())
+}
 
 #[tauri::command]
 async fn send_payment_order_message(
@@ -873,6 +1112,7 @@ pub async fn run() {
         .invoke_handler(tauri::generate_handler![
             start_upload,
             confirm_upload_payment,
+            confirm_merkle_upload_payment,
             send_payment_order_message,
             get_vault_structure,
             get_vault_structure_streaming,

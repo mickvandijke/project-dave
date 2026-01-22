@@ -13,16 +13,19 @@ pub use types::{
 use crate::ant::app_data;
 use crate::ant::cached_payments::PaymentCache;
 use crate::ant::client::SharedClient;
+use crate::ant::merkle_payments::{should_use_merkle_payments, MERKLE_PAYMENT_THRESHOLD};
 use crate::PendingUploadData;
 use crate::ant::encryption::encrypt_file_or_folder;
 use crate::ant::quote::combine_quotes;
 use crate::ant::receipt_utils::validate_receipt_coverage_with_content_addresses;
 use crate::ant::stream::content_addresses_from_encryption_stream;
-use crate::ant::upload::batch_upload_encryption_stream;
+use crate::ant::upload::{batch_upload_encryption_stream, batch_upload_encryption_stream_merkle, batch_upload_encryption_streams_merkle};
 use crate::ant::{local_storage, vault};
 use autonomi::chunk::DataMapChunk;
+use autonomi::client::merkle_payments::PreparedMerklePayment;
 use autonomi::client::payment::{PaymentOption, Receipt};
 use autonomi::client::quote::DataTypes;
+use autonomi::self_encryption::MAX_CHUNK_SIZE;
 use autonomi::client::vault::key::vault_key_from_signature_hex;
 use autonomi::client::vault::{UserData, VaultSecretKey};
 use autonomi::data::DataAddress;
@@ -139,6 +142,41 @@ fn build_payment_data(store_quote: &StoreQuote) -> (Amount, Vec<serde_json::Valu
         .collect();
 
     (total_cost, payments_json, raw_payments)
+}
+
+/// Emits a merkle-payment-quote event for bulk uploads using merkle tree payments.
+///
+/// The `prepared` argument contains the pool commitments and other data needed
+/// by the frontend to call the MerklePaymentVault smart contract.
+fn emit_merkle_payment_quote(
+    app: &AppHandle,
+    upload_id: &str,
+    total_files: usize,
+    total_size: u64,
+    estimated_cost: Amount,
+    prepared: &PreparedMerklePayment,
+) -> Result<(), UploadError> {
+    info!(
+        "Emitting merkle-payment-quote event for upload_id: {}, depth: {}, pools: {}, cost: {}",
+        upload_id, prepared.depth, prepared.pool_commitments.len(), estimated_cost
+    );
+
+    app.emit(
+        "merkle-payment-quote",
+        serde_json::json!({
+            "upload_id": upload_id,
+            "depth": prepared.depth,
+            "pool_commitments": prepared.pool_commitments,
+            "merkle_payment_timestamp": prepared.merkle_payment_timestamp,
+            "estimated_cost": estimated_cost.to_string(),
+            "total_files": total_files,
+            "total_size": total_size,
+        }),
+    )
+    .map_err(|err| {
+        error!("Failed to emit merkle-payment-quote event: {}", err);
+        UploadError::EmitEvent(err.to_string())
+    })
 }
 
 /// Retrieves user data from vault, creating new if vault doesn't exist yet.
@@ -595,6 +633,15 @@ pub struct ExecuteUploadContext {
     pub vault_secret_key: Option<VaultSecretKey>,
 }
 
+/// Context for executing a merkle upload after external payment confirmation.
+pub struct ExecuteMerkleUploadContext {
+    pub upload_id: String,
+    pub add_to_vault: bool,
+    pub merkle_receipt: autonomi::client::merkle_payments::MerklePaymentReceipt,
+    pub vault_update: vault::VaultUpdate,
+    pub vault_secret_key: Option<VaultSecretKey>,
+}
+
 pub async fn start_private_single_file_upload(
     app: AppHandle,
     file: File,
@@ -710,13 +757,24 @@ pub async fn start_private_single_file_upload(
     // Calculate total cost and emit quote event
     let (total_cost, payments, raw_payments) = build_payment_data(&total_store_quote);
 
-    info!("Emitting upload-quote event for upload_id: {}", upload_id);
-    emit_upload_quote(&app, &upload_id, 1, file_size, total_cost, &payments, &raw_payments)?;
-    info!("Successfully emitted upload-quote event");
+    // Check if merkle payments should be used
+    let app_data = app_data::AppData::load().unwrap_or_default();
+    let chunk_count = total_store_quote.len();
+    let use_merkle = should_use_merkle_payments(
+        app_data.use_merkle_payments,
+        app_data.use_paymaster,
+        chunk_count,
+    );
+
+    info!(
+        "Payment decision for upload_id {}: use_merkle={}, chunk_count={}, threshold={}",
+        upload_id, use_merkle, chunk_count, MERKLE_PAYMENT_THRESHOLD
+    );
 
     // If cost is 0, this is a duplicate file - skip upload and mark as completed
     if total_cost == Amount::ZERO {
         info!("Duplicate file detected (cost=0), marking as completed immediately for upload_id: {}", upload_id);
+        emit_zero_cost_quote(&app, &upload_id, 1, file_size)?;
         emit_upload_progress(
             &app,
             UploadProgress::Completed {
@@ -728,21 +786,65 @@ pub async fn start_private_single_file_upload(
             },
         )?;
         info!("Emitted completion event for duplicate file upload_id: {}", upload_id);
-    } else if let Some(pending_uploads) = pending_uploads {
-        // Store upload data for later execution after payment
-        let mut pending = pending_uploads.lock().await;
-        pending.store(
-            upload_id.clone(),
-            PendingUploadData::SingleFile {
-                file,
-                datamap: data_map_chunk,
-                store_quote: total_store_quote,
-                vault_update,
-                secret_key: vault_secret_key,
-                add_to_vault,
-                cached_receipt: cached_result.cached_receipt,
-            },
-        );
+    } else if use_merkle {
+        // Use merkle payment flow
+        info!("Using merkle payment for upload_id: {}", upload_id);
+
+        // Collect content addresses for merkle payment preparation
+        let content_addrs: Vec<XorName> = total_store_quote.0.keys().cloned().collect();
+        info!("Collected {} content addresses for merkle payment", content_addrs.len());
+
+        // Prepare merkle payment (queries network for candidate pools)
+        info!("Calling prepare_merkle_payment_external...");
+        let prepared = client
+            .prepare_merkle_payment_external(
+                DataTypes::Chunk,
+                content_addrs.into_iter(),
+                MAX_CHUNK_SIZE,
+            )
+            .await?;
+        info!("prepare_merkle_payment_external completed successfully, depth={}, pools={}",
+              prepared.depth, prepared.pool_commitments.len());
+
+        emit_merkle_payment_quote(&app, &upload_id, 1, file_size, total_cost, &prepared)?;
+        info!("emit_merkle_payment_quote completed successfully");
+
+        if let Some(pending_uploads) = pending_uploads {
+            let mut pending = pending_uploads.lock().await;
+            pending.store(
+                upload_id.clone(),
+                PendingUploadData::SingleFileMerkle {
+                    file,
+                    datamap: data_map_chunk,
+                    prepared_payment: prepared,
+                    vault_update,
+                    secret_key: vault_secret_key,
+                    add_to_vault,
+                },
+            );
+        }
+    } else {
+        // Use standard payment flow
+        info!("Emitting upload-quote event for upload_id: {}", upload_id);
+        emit_upload_quote(&app, &upload_id, 1, file_size, total_cost, &payments, &raw_payments)?;
+        info!("Successfully emitted upload-quote event");
+
+        if let Some(pending_uploads) = pending_uploads {
+            // Store upload data for later execution after payment
+            let mut pending = pending_uploads.lock().await;
+            pending.store(
+                upload_id.clone(),
+                PendingUploadData::SingleFile {
+                    file,
+                    datamap: data_map_chunk,
+                    store_quote: total_store_quote,
+                    vault_update,
+                    secret_key: vault_secret_key,
+                    add_to_vault,
+                    cached_receipt: cached_result.cached_receipt,
+                },
+            );
+        }
     }
 
     Ok(())
@@ -942,13 +1044,24 @@ pub async fn start_public_single_file_upload(
     // Calculate total cost and emit quote event
     let (total_cost, payments, raw_payments) = build_payment_data(&total_store_quote);
 
-    info!("Emitting upload-quote event for public upload_id: {}", upload_id);
-    emit_upload_quote(&app, &upload_id, 1, file_size, total_cost, &payments, &raw_payments)?;
-    debug!("Successfully emitted upload-quote event");
+    // Check if merkle payments should be used
+    let app_data = app_data::AppData::load().unwrap_or_default();
+    let chunk_count = total_store_quote.len();
+    let use_merkle = should_use_merkle_payments(
+        app_data.use_merkle_payments,
+        app_data.use_paymaster,
+        chunk_count,
+    );
+
+    info!(
+        "Payment decision for public upload_id {}: use_merkle={}, chunk_count={}, threshold={}",
+        upload_id, use_merkle, chunk_count, MERKLE_PAYMENT_THRESHOLD
+    );
 
     // If cost is 0, this is a duplicate file - skip upload and mark as completed
     if total_cost == Amount::ZERO {
         info!("Duplicate public file detected (cost=0), marking as completed immediately for upload_id: {}", upload_id);
+        emit_zero_cost_quote(&app, &upload_id, 1, file_size)?;
         emit_upload_progress(
             &app,
             UploadProgress::Completed {
@@ -960,21 +1073,60 @@ pub async fn start_public_single_file_upload(
             },
         )?;
         info!("Emitted completion event for duplicate public file upload_id: {}", upload_id);
-    } else if let Some(pending_uploads) = pending_uploads {
-        // Store upload data for later execution after payment
-        let mut pending = pending_uploads.lock().await;
-        pending.store(
-            upload_id.clone(),
-            PendingUploadData::SingleFilePublic {
-                file,
-                datamap: data_map_chunk,
-                store_quote: total_store_quote,
-                vault_update,
-                add_to_vault,
-                vault_secret_key,
-                cached_receipt: cached_result.cached_receipt,
-            },
-        );
+    } else if use_merkle {
+        // Use merkle payment flow
+        info!("Using merkle payment for public upload_id: {}", upload_id);
+
+        // Collect content addresses for merkle payment preparation
+        let content_addrs: Vec<XorName> = total_store_quote.0.keys().cloned().collect();
+
+        // Prepare merkle payment (queries network for candidate pools)
+        let prepared = client
+            .prepare_merkle_payment_external(
+                DataTypes::Chunk,
+                content_addrs.into_iter(),
+                MAX_CHUNK_SIZE,
+            )
+            .await?;
+
+        emit_merkle_payment_quote(&app, &upload_id, 1, file_size, total_cost, &prepared)?;
+
+        if let Some(pending_uploads) = pending_uploads {
+            let mut pending = pending_uploads.lock().await;
+            pending.store(
+                upload_id.clone(),
+                PendingUploadData::SingleFileMerklePublic {
+                    file,
+                    datamap: data_map_chunk,
+                    prepared_payment: prepared,
+                    vault_update,
+                    add_to_vault,
+                    vault_secret_key,
+                },
+            );
+        }
+    } else {
+        // Use standard payment flow
+        info!("Emitting upload-quote event for public upload_id: {}", upload_id);
+        emit_upload_quote(&app, &upload_id, 1, file_size, total_cost, &payments, &raw_payments)?;
+        debug!("Successfully emitted upload-quote event");
+
+        if let Some(pending_uploads) = pending_uploads {
+            // Store upload data for later execution after payment
+            let mut pending = pending_uploads.lock().await;
+            pending.store(
+                upload_id.clone(),
+                PendingUploadData::SingleFilePublic {
+                    file,
+                    datamap: data_map_chunk,
+                    store_quote: total_store_quote,
+                    vault_update,
+                    add_to_vault,
+                    vault_secret_key,
+                    cached_receipt: cached_result.cached_receipt,
+                },
+            );
+        }
     }
 
     Ok(())
@@ -1269,13 +1421,24 @@ pub async fn start_private_archive_upload(
     // Calculate total cost and emit quote event
     let (total_cost, payments, raw_payments) = build_payment_data(&total_store_quote);
 
-    debug!(upload_id = %upload_id, "Emitting upload-quote event for private archive");
-    emit_upload_quote(&app, &upload_id, total_files, total_size, total_cost, &payments, &raw_payments)?;
-    debug!("Successfully emitted upload-quote event");
+    // Check if merkle payments should be used
+    let app_data = app_data::AppData::load().unwrap_or_default();
+    let chunk_count = total_store_quote.len();
+    let use_merkle = should_use_merkle_payments(
+        app_data.use_merkle_payments,
+        app_data.use_paymaster,
+        chunk_count,
+    );
+
+    info!(
+        "Payment decision for private archive upload_id {}: use_merkle={}, chunk_count={}, threshold={}",
+        upload_id, use_merkle, chunk_count, MERKLE_PAYMENT_THRESHOLD
+    );
 
     // If cost is 0, this is a duplicate archive - mark as completed
     if total_cost == Amount::ZERO {
         debug!(upload_id = %upload_id, "Duplicate private archive detected (cost=0), marking as completed immediately");
+        emit_zero_cost_quote(&app, &upload_id, total_files, total_size)?;
         emit_upload_progress(
             &app,
             UploadProgress::Completed {
@@ -1287,23 +1450,64 @@ pub async fn start_private_archive_upload(
             },
         )?;
         debug!(upload_id = %upload_id, "Emitted completion event for duplicate private archive");
-    } else if let Some(pending_uploads) = pending_uploads {
-        // Store upload data for later execution after payment
-        let mut pending = pending_uploads.lock().await;
-        pending.store(
-            upload_id.clone(),
-            PendingUploadData::PrivateArchive {
-                files,
-                archive_name,
-                archive_datamap: archive_datamap_chunk,
-                archive: private_archive,
-                store_quote: total_store_quote,
-                vault_update,
-                add_to_vault,
-                vault_secret_key,
-                cached_receipt: cached_result.cached_receipt,
-            },
-        );
+    } else if use_merkle {
+        // Use merkle payment flow
+        info!("Using merkle payment for private archive upload_id: {}", upload_id);
+
+        // Collect content addresses for merkle payment preparation
+        let content_addrs: Vec<XorName> = total_store_quote.0.keys().cloned().collect();
+
+        // Prepare merkle payment (queries network for candidate pools)
+        let prepared = client
+            .prepare_merkle_payment_external(
+                DataTypes::Chunk,
+                content_addrs.into_iter(),
+                MAX_CHUNK_SIZE,
+            )
+            .await?;
+
+        emit_merkle_payment_quote(&app, &upload_id, total_files, total_size, total_cost, &prepared)?;
+
+        if let Some(pending_uploads) = pending_uploads {
+            let mut pending = pending_uploads.lock().await;
+            pending.store(
+                upload_id.clone(),
+                PendingUploadData::PrivateArchiveMerkle {
+                    files,
+                    archive_name,
+                    archive_datamap: archive_datamap_chunk,
+                    archive: private_archive,
+                    prepared_payment: prepared,
+                    vault_update,
+                    add_to_vault,
+                    vault_secret_key,
+                },
+            );
+        }
+    } else {
+        // Use standard payment flow
+        debug!(upload_id = %upload_id, "Emitting upload-quote event for private archive");
+        emit_upload_quote(&app, &upload_id, total_files, total_size, total_cost, &payments, &raw_payments)?;
+        debug!("Successfully emitted upload-quote event");
+
+        if let Some(pending_uploads) = pending_uploads {
+            // Store upload data for later execution after payment
+            let mut pending = pending_uploads.lock().await;
+            pending.store(
+                upload_id.clone(),
+                PendingUploadData::PrivateArchive {
+                    files,
+                    archive_name,
+                    archive_datamap: archive_datamap_chunk,
+                    archive: private_archive,
+                    store_quote: total_store_quote,
+                    vault_update,
+                    add_to_vault,
+                    vault_secret_key,
+                    cached_receipt: cached_result.cached_receipt,
+                },
+            );
+        }
     }
 
     Ok(())
@@ -1665,13 +1869,24 @@ pub async fn start_public_archive_upload(
     // Calculate total cost and emit quote event
     let (total_cost, payments, raw_payments) = build_payment_data(&total_store_quote);
 
-    debug!(upload_id = %upload_id, "Emitting upload-quote event for public archive");
-    emit_upload_quote(&app, &upload_id, total_files, total_size, total_cost, &payments, &raw_payments)?;
-    debug!("Successfully emitted upload-quote event");
+    // Check if merkle payments should be used
+    let app_data = app_data::AppData::load().unwrap_or_default();
+    let chunk_count = total_store_quote.len();
+    let use_merkle = should_use_merkle_payments(
+        app_data.use_merkle_payments,
+        app_data.use_paymaster,
+        chunk_count,
+    );
+
+    info!(
+        "Payment decision for public archive upload_id {}: use_merkle={}, chunk_count={}, threshold={}",
+        upload_id, use_merkle, chunk_count, MERKLE_PAYMENT_THRESHOLD
+    );
 
     // If cost is 0, this is a duplicate archive - mark as completed
     if total_cost == Amount::ZERO {
         debug!(upload_id = %upload_id, "Duplicate public archive detected (cost=0), marking as completed immediately");
+        emit_zero_cost_quote(&app, &upload_id, total_files, total_size)?;
         emit_upload_progress(
             &app,
             UploadProgress::Completed {
@@ -1683,22 +1898,62 @@ pub async fn start_public_archive_upload(
             },
         )?;
         debug!(upload_id = %upload_id, "Emitted completion event for duplicate public archive");
-    } else if let Some(pending_uploads) = pending_uploads {
-        // Store upload data for later execution after payment
-        let mut pending = pending_uploads.lock().await;
-        pending.store(
-            upload_id.clone(),
-            PendingUploadData::PublicArchive {
-                files,
-                archive_name,
-                archive: public_archive,
-                store_quote: total_store_quote,
-                vault_update,
-                add_to_vault,
-                vault_secret_key,
-                cached_receipt: cached_result.cached_receipt,
-            },
-        );
+    } else if use_merkle {
+        // Use merkle payment flow
+        info!("Using merkle payment for public archive upload_id: {}", upload_id);
+
+        // Collect content addresses for merkle payment preparation
+        let content_addrs: Vec<XorName> = total_store_quote.0.keys().cloned().collect();
+
+        // Prepare merkle payment (queries network for candidate pools)
+        let prepared = client
+            .prepare_merkle_payment_external(
+                DataTypes::Chunk,
+                content_addrs.into_iter(),
+                MAX_CHUNK_SIZE,
+            )
+            .await?;
+
+        emit_merkle_payment_quote(&app, &upload_id, total_files, total_size, total_cost, &prepared)?;
+
+        if let Some(pending_uploads) = pending_uploads {
+            let mut pending = pending_uploads.lock().await;
+            pending.store(
+                upload_id.clone(),
+                PendingUploadData::PublicArchiveMerkle {
+                    files,
+                    archive_name,
+                    archive: public_archive,
+                    prepared_payment: prepared,
+                    vault_update,
+                    add_to_vault,
+                    vault_secret_key,
+                },
+            );
+        }
+    } else {
+        // Use standard payment flow
+        debug!(upload_id = %upload_id, "Emitting upload-quote event for public archive");
+        emit_upload_quote(&app, &upload_id, total_files, total_size, total_cost, &payments, &raw_payments)?;
+        debug!("Successfully emitted upload-quote event");
+
+        if let Some(pending_uploads) = pending_uploads {
+            // Store upload data for later execution after payment
+            let mut pending = pending_uploads.lock().await;
+            pending.store(
+                upload_id.clone(),
+                PendingUploadData::PublicArchive {
+                    files,
+                    archive_name,
+                    archive: public_archive,
+                    store_quote: total_store_quote,
+                    vault_update,
+                    add_to_vault,
+                    vault_secret_key,
+                    cached_receipt: cached_result.cached_receipt,
+                },
+            );
+        }
     }
 
     Ok(())
@@ -1867,6 +2122,328 @@ pub async fn execute_public_archive_upload(
     });
 
     // Return immediately - the upload continues in background
+    Ok(())
+}
+
+// ============================================================================
+// Merkle payment execute functions
+// ============================================================================
+
+pub async fn execute_private_single_file_upload_merkle(
+    app: AppHandle,
+    file: File,
+    datamap: DataMapChunk,
+    ctx: ExecuteMerkleUploadContext,
+    shared_client: State<'_, SharedClient>,
+) -> Result<(), UploadError> {
+    let ExecuteMerkleUploadContext {
+        upload_id,
+        add_to_vault,
+        merkle_receipt,
+        vault_update,
+        vault_secret_key,
+    } = ctx;
+
+    let client = shared_client.get_client().await?;
+    let file_size = fs::metadata(&file.path)
+        .await
+        .map_err(|_| UploadError::Read(file.path.clone()))?
+        .len();
+
+    // Emit initial progress events
+    emit_initial_upload_progress(&app, &upload_id, 1, file_size)?;
+
+    tokio::spawn(async move {
+        let result = async {
+            // Create encryption stream for upload
+            let mut encryption_streams = encrypt_file_or_folder(file.path.clone(), false)
+                .await
+                .map_err(|err| UploadError::Encryption(format!("{:?}", err)))?;
+
+            let stream = encryption_streams
+                .pop()
+                .ok_or(UploadError::Encryption("Expected one stream".to_string()))?;
+
+            batch_upload_encryption_stream_merkle(&client, &merkle_receipt, stream)
+                .await
+                .map_err(|err| UploadError::Put(format!("{:?}", err)))?;
+
+            // Store file in vault if requested (using empty receipt for vault update)
+            if let (true, Some(secret_key)) = (add_to_vault, vault_secret_key.as_ref()) {
+                update_vault_with_item(
+                    &client,
+                    secret_key,
+                    VaultItem::PrivateFile {
+                        data_map_chunk: datamap.clone(),
+                        name: file.name.clone(),
+                    },
+                    Receipt::default(), // Vault updates don't need the merkle receipt
+                    vault_update,
+                )
+                .await?;
+            }
+
+            // Store file locally
+            local_storage::write_local_private_file(
+                datamap.to_hex(),
+                datamap.address(),
+                &file.name,
+            )
+            .map_err(|err| UploadError::StoreQuote(err.to_string()))?;
+
+            Ok::<(), UploadError>(())
+        }
+        .await;
+
+        emit_upload_result(
+            &app,
+            result,
+            &upload_id,
+            1,
+            file_size,
+            add_to_vault,
+            FileAccess::Private(datamap),
+        );
+    });
+
+    Ok(())
+}
+
+pub async fn execute_public_single_file_upload_merkle(
+    app: AppHandle,
+    file: File,
+    datamap: DataMapChunk,
+    ctx: ExecuteMerkleUploadContext,
+    shared_client: State<'_, SharedClient>,
+) -> Result<(), UploadError> {
+    let ExecuteMerkleUploadContext {
+        upload_id,
+        add_to_vault,
+        merkle_receipt,
+        vault_update,
+        vault_secret_key,
+    } = ctx;
+
+    let client = shared_client.get_client().await?;
+    let file_size = fs::metadata(&file.path)
+        .await
+        .map_err(|_| UploadError::Read(file.path.clone()))?
+        .len();
+
+    emit_initial_upload_progress(&app, &upload_id, 1, file_size)?;
+
+    let public_data_address = DataAddress::new(*datamap.0.name());
+
+    tokio::spawn(async move {
+        let result = async {
+            let mut encryption_streams = encrypt_file_or_folder(file.path.clone(), true)
+                .await
+                .map_err(|err| UploadError::Encryption(format!("{:?}", err)))?;
+
+            let stream = encryption_streams
+                .pop()
+                .ok_or(UploadError::Encryption("Expected one stream".to_string()))?;
+
+            batch_upload_encryption_stream_merkle(&client, &merkle_receipt, stream)
+                .await
+                .map_err(|err| UploadError::Put(format!("{:?}", err)))?;
+
+            if let (true, Some(secret_key)) = (add_to_vault, vault_secret_key.as_ref()) {
+                update_vault_with_item(
+                    &client,
+                    secret_key,
+                    VaultItem::PublicFile {
+                        data_address: public_data_address,
+                        name: file.name.clone(),
+                    },
+                    Receipt::default(),
+                    vault_update,
+                )
+                .await?;
+            }
+
+            local_storage::write_local_public_file(
+                hex::encode(public_data_address.xorname().0),
+                &file.name,
+            )
+            .map_err(|err| UploadError::StoreQuote(err.to_string()))?;
+
+            Ok::<(), UploadError>(())
+        }
+        .await;
+
+        emit_upload_result(
+            &app,
+            result,
+            &upload_id,
+            1,
+            file_size,
+            add_to_vault,
+            FileAccess::Public(public_data_address),
+        );
+    });
+
+    Ok(())
+}
+
+pub async fn execute_private_archive_upload_merkle(
+    app: AppHandle,
+    files: Vec<File>,
+    archive_name: String,
+    archive_datamap: DataMapChunk,
+    archive: PrivateArchive,
+    ctx: ExecuteMerkleUploadContext,
+    shared_client: State<'_, SharedClient>,
+) -> Result<(), UploadError> {
+    let ExecuteMerkleUploadContext {
+        upload_id,
+        add_to_vault,
+        merkle_receipt,
+        vault_update,
+        vault_secret_key,
+    } = ctx;
+
+    let client = shared_client.get_client().await?;
+    let total_size: u64 = archive.map().values().map(|(_, m)| m.size).sum();
+
+    emit_initial_upload_progress(&app, &upload_id, files.len(), total_size)?;
+
+    tokio::spawn(async move {
+        let result = async {
+            // Create encryption streams for all files
+            let mut all_streams = Vec::new();
+            for file in &files {
+                let streams = encrypt_file_or_folder(file.path.clone(), false)
+                    .await
+                    .map_err(|err| UploadError::Encryption(format!("{:?}", err)))?;
+                all_streams.extend(streams);
+            }
+
+            // Upload all streams with merkle proofs
+            batch_upload_encryption_streams_merkle(&client, &merkle_receipt, all_streams)
+                .await
+                .map_err(|err| UploadError::Put(format!("{:?}", err)))?;
+
+            if let (true, Some(secret_key)) = (add_to_vault, vault_secret_key.as_ref()) {
+                update_vault_with_item(
+                    &client,
+                    secret_key,
+                    VaultItem::PrivateArchive {
+                        data_map_chunk: archive_datamap.clone(),
+                        name: archive_name.clone(),
+                    },
+                    Receipt::default(),
+                    vault_update,
+                )
+                .await?;
+            }
+
+            local_storage::write_local_private_file_archive(
+                archive_datamap.to_hex(),
+                archive_datamap.address(),
+                &archive_name,
+            )
+            .map_err(|err| UploadError::StoreQuote(err.to_string()))?;
+
+            Ok::<(), UploadError>(())
+        }
+        .await;
+
+        emit_upload_result(
+            &app,
+            result,
+            &upload_id,
+            files.len(),
+            total_size,
+            add_to_vault,
+            FileAccess::Private(archive_datamap),
+        );
+    });
+
+    Ok(())
+}
+
+pub async fn execute_public_archive_upload_merkle(
+    app: AppHandle,
+    files: Vec<File>,
+    archive_name: String,
+    archive: PublicArchive,
+    ctx: ExecuteMerkleUploadContext,
+    shared_client: State<'_, SharedClient>,
+) -> Result<(), UploadError> {
+    let ExecuteMerkleUploadContext {
+        upload_id,
+        add_to_vault,
+        merkle_receipt,
+        vault_update,
+        vault_secret_key,
+    } = ctx;
+
+    let client = shared_client.get_client().await?;
+    let total_size: u64 = archive.map().values().map(|(_, m)| m.size).sum();
+
+    // Serialize the archive to get the address
+    let archive_bytes = archive
+        .to_bytes()
+        .map_err(|err| UploadError::Encryption(err.to_string()))?;
+    let (archive_datamap, _archive_chunks) = autonomi::self_encryption::encrypt(archive_bytes)
+        .map_err(|err| UploadError::Encryption(err.to_string()))?;
+    let archive_datamap_chunk = DataMapChunk::from(archive_datamap);
+    let public_archive_address = DataAddress::new(archive_datamap_chunk.0.name().to_owned());
+
+    emit_initial_upload_progress(&app, &upload_id, files.len(), total_size)?;
+
+    tokio::spawn(async move {
+        let result = async {
+            // Create encryption streams for all files
+            let mut all_streams = Vec::new();
+            for file in &files {
+                let streams = encrypt_file_or_folder(file.path.clone(), true)
+                    .await
+                    .map_err(|err| UploadError::Encryption(format!("{:?}", err)))?;
+                all_streams.extend(streams);
+            }
+
+            // Upload all streams with merkle proofs
+            batch_upload_encryption_streams_merkle(&client, &merkle_receipt, all_streams)
+                .await
+                .map_err(|err| UploadError::Put(format!("{:?}", err)))?;
+
+            if let (true, Some(secret_key)) = (add_to_vault, vault_secret_key.as_ref()) {
+                update_vault_with_item(
+                    &client,
+                    secret_key,
+                    VaultItem::PublicArchive {
+                        data_address: public_archive_address,
+                        name: archive_name.clone(),
+                    },
+                    Receipt::default(),
+                    vault_update,
+                )
+                .await?;
+            }
+
+            local_storage::write_local_public_file_archive(
+                hex::encode(public_archive_address.xorname().0),
+                &archive_name,
+            )
+            .ok();
+
+            Ok::<(), UploadError>(())
+        }
+        .await;
+
+        emit_upload_result(
+            &app,
+            result,
+            &upload_id,
+            files.len(),
+            total_size,
+            add_to_vault,
+            FileAccess::Public(public_archive_address),
+        );
+    });
+
     Ok(())
 }
 

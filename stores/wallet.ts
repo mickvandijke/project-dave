@@ -13,6 +13,7 @@ import {
     type Call,
     concat,
     createPublicClient,
+    decodeEventLog,
     encodeFunctionData,
     formatUnits,
     type Hex,
@@ -25,10 +26,12 @@ import {
 import {arbitrum} from "viem/chains";
 import tokenAbi from "~/assets/abi/PaymentToken.json";
 import paymentVaultAbi from "~/assets/abi/IPaymentVault.json";
+import merklePaymentVaultAbi from "~/assets/abi/IMerklePaymentVault.json";
 import paymasterAbi from "~/assets/abi/AutonomiPaymaster.json";
 import permitAbi from "~/assets/abi/Permit.json";
 import {wagmiAdapter} from "~/config";
 import {PAYMASTER_ADDRESS, PIMLICO_API_KEY} from "~/config/paymaster";
+import {MERKLE_PAYMENT_VAULT_ADDRESS} from "~/config/contracts";
 import {
     createPimlicoSmartAccountClient,
     getSmartAccount,
@@ -41,8 +44,42 @@ import type {SmartAccountInfo, PaymasterCostEstimate, PaymasterCostEstimateOptio
 
 const tokenContractAddress = "0xa78d8321B20c4Ef90eCd72f2588AA985A4BDb684";
 const paymentVaultContractAddress = "0xB1b5219f8Aaa18037A2506626Dd0406a46f70BcC";
+const merklePaymentVaultContractAddress = MERKLE_PAYMENT_VAULT_ADDRESS;
 const VAULT_SECRET_KEY_SEED = "Massive Array of Internet Disks Secure Access For Everyone";
 const MAX_PAYMENTS_PER_TRANSACTION = 256;
+
+// Merkle payment types matching the IMerklePaymentVault contract
+// Note: The contract only uses these 3 fields (matching autonomi crate's encoding)
+export interface QuotingMetrics {
+    dataType: number;
+    closeRecordsStored: bigint;
+    recordsPerType: { dataType: number; records: bigint }[];
+}
+
+export interface CandidateNode {
+    rewardsAddress: string;
+    metrics: QuotingMetrics;
+}
+
+export interface PoolCommitment {
+    poolHash: `0x${string}`;
+    candidates: CandidateNode[];
+}
+
+export interface MerklePaymentOrder {
+    uploadId: string;
+    depth: number;
+    poolCommitments: PoolCommitment[];
+    merklePaymentTimestamp: bigint;
+    estimatedCost: bigint;
+    totalFiles: number;
+    totalSize: bigint;
+}
+
+export interface MerklePaymentResult {
+    winnerPoolHash: string;
+    amountPaid: string;
+}
 
 let isSetWalletModalListener = false;
 
@@ -1397,6 +1434,244 @@ export const useWalletStore = defineStore("wallet", () => {
         console.log("Smart account funded successfully");
     };
 
+    // Merkle Payment Functions
+
+    /**
+     * Estimates the cost of a merkle tree payment
+     * @param depth - Merkle tree depth
+     * @param poolCommitments - Array of pool commitments
+     * @param merklePaymentTimestamp - Timestamp for the payment
+     * @returns Estimated cost in wei
+     */
+    const estimateMerkleTreeCost = async (
+        depth: number,
+        poolCommitments: PoolCommitment[],
+        merklePaymentTimestamp: bigint
+    ): Promise<bigint> => {
+        await ensureCorrectChain();
+
+        console.log('[estimateMerkleTreeCost] === MERKLE PAYMENT DEBUG ===');
+        console.log('[estimateMerkleTreeCost] Depth:', depth);
+        console.log('[estimateMerkleTreeCost] Expected pool count (2^ceil(depth/2)):', 1 << Math.ceil(depth / 2));
+        console.log('[estimateMerkleTreeCost] Actual pool count:', poolCommitments.length);
+        console.log('[estimateMerkleTreeCost] Merkle timestamp:', merklePaymentTimestamp);
+        console.log('[estimateMerkleTreeCost] Current time (seconds):', Math.floor(Date.now() / 1000));
+        console.log('[estimateMerkleTreeCost] Time difference (seconds):', Math.floor(Date.now() / 1000) - Number(merklePaymentTimestamp));
+
+        // Validate and log each pool commitment
+        for (let i = 0; i < poolCommitments.length; i++) {
+            const pool = poolCommitments[i];
+            console.log(`[estimateMerkleTreeCost] Pool ${i}:`);
+            console.log(`  - poolHash: ${pool.poolHash} (length: ${pool.poolHash.length})`);
+            console.log(`  - candidates count: ${pool.candidates.length} (expected: 16)`);
+
+            if (pool.candidates.length !== 16) {
+                console.error(`[estimateMerkleTreeCost] ERROR: Pool ${i} has ${pool.candidates.length} candidates, expected 16!`);
+            }
+
+            // Log first candidate's metrics (only the 3 fields sent to contract)
+            if (pool.candidates[0]) {
+                const c = pool.candidates[0];
+                console.log(`  - First candidate rewardsAddress: ${c.rewardsAddress}`);
+                console.log(`  - First candidate metrics:`, {
+                    dataType: c.metrics.dataType,
+                    closeRecordsStored: c.metrics.closeRecordsStored.toString(),
+                    recordsPerType: c.metrics.recordsPerType.map(r => ({ dataType: r.dataType, records: r.records.toString() }))
+                });
+            }
+        }
+
+        // Validate timestamp is within uint64 range
+        const MAX_UINT64 = BigInt("18446744073709551615");
+        if (merklePaymentTimestamp > MAX_UINT64) {
+            console.error(`[estimateMerkleTreeCost] ERROR: timestamp ${merklePaymentTimestamp} exceeds uint64 max!`);
+        }
+
+        // Validate depth is within uint8 range and reasonable
+        if (depth > 255) {
+            console.error(`[estimateMerkleTreeCost] ERROR: depth ${depth} exceeds uint8 max!`);
+        }
+        if (depth > 8) {
+            console.warn(`[estimateMerkleTreeCost] WARNING: depth ${depth} exceeds expected MAX_MERKLE_DEPTH of 8`);
+        }
+
+        console.log('[estimateMerkleTreeCost] Calling contract at:', merklePaymentVaultContractAddress);
+        console.log('[estimateMerkleTreeCost] Contract args:', {
+            depth,
+            poolCommitmentsCount: poolCommitments.length,
+            merklePaymentTimestamp: merklePaymentTimestamp.toString()
+        });
+
+        // Log a summary of what we're sending (useful for comparison with Rust crate)
+        console.log('[estimateMerkleTreeCost] === DATA SUMMARY FOR CONTRACT CALL ===');
+        console.log(`depth: ${depth} (uint8)`);
+        console.log(`merklePaymentTimestamp: ${merklePaymentTimestamp} (uint64)`);
+        console.log(`poolCommitments: ${poolCommitments.length} pools`);
+        poolCommitments.forEach((pool, i) => {
+            console.log(`  Pool[${i}].poolHash: ${pool.poolHash} (bytes32, ${pool.poolHash.length} chars)`);
+            console.log(`  Pool[${i}].candidates: ${pool.candidates.length} candidates`);
+            if (pool.candidates[0]) {
+                const m = pool.candidates[0].metrics;
+                console.log(`    First candidate metrics: dataType=${m.dataType}, recordsPerType.length=${m.recordsPerType.length}`);
+            }
+        });
+        console.log('[estimateMerkleTreeCost] =====================================');
+
+        try {
+            const result = await readContract(wagmiAdapter.wagmiConfig, {
+                abi: merklePaymentVaultAbi,
+                address: merklePaymentVaultContractAddress,
+                functionName: "estimateMerkleTreeCost",
+                args: [depth, poolCommitments, merklePaymentTimestamp]
+            });
+
+            console.log('[estimateMerkleTreeCost] Estimated cost:', result);
+            return result as bigint;
+        } catch (error: any) {
+            console.error('[estimateMerkleTreeCost] Contract call failed!');
+            console.error('[estimateMerkleTreeCost] Error name:', error.name);
+            console.error('[estimateMerkleTreeCost] Error message:', error.message);
+
+            // Try to extract more details from viem error
+            if (error.shortMessage) {
+                console.error('[estimateMerkleTreeCost] Short message:', error.shortMessage);
+            }
+            if (error.details) {
+                console.error('[estimateMerkleTreeCost] Details:', error.details);
+            }
+            if (error.cause) {
+                console.error('[estimateMerkleTreeCost] Error cause:', error.cause);
+                console.error('[estimateMerkleTreeCost] Error cause name:', error.cause?.name);
+                console.error('[estimateMerkleTreeCost] Error cause reason:', error.cause?.reason);
+                console.error('[estimateMerkleTreeCost] Error cause signature:', error.cause?.signature);
+                if (error.cause.data) {
+                    console.error('[estimateMerkleTreeCost] Error cause data:', error.cause.data);
+                }
+                if (error.cause.metaMessages) {
+                    console.error('[estimateMerkleTreeCost] Error cause metaMessages:', error.cause.metaMessages);
+                }
+            }
+            if (error.data) {
+                console.error('[estimateMerkleTreeCost] Error data (hex):', error.data);
+            }
+            if (error.metaMessages) {
+                console.error('[estimateMerkleTreeCost] Error metaMessages:', error.metaMessages);
+            }
+            if (error.contractAddress) {
+                console.error('[estimateMerkleTreeCost] Contract address:', error.contractAddress);
+            }
+
+            // Try to decode the error if it's a custom error
+            console.error('[estimateMerkleTreeCost] Checking for revert data...');
+            const revertData = error.cause?.data || error.data;
+            if (revertData && revertData !== '0x') {
+                console.error('[estimateMerkleTreeCost] Revert data found:', revertData);
+                // Common error selectors
+                const errorSelectors: Record<string, string> = {
+                    '0x08c379a0': 'Error(string)', // Standard error
+                    '0x4e487b71': 'Panic(uint256)', // Panic codes
+                };
+                const selector = revertData.slice(0, 10);
+                if (errorSelectors[selector]) {
+                    console.error('[estimateMerkleTreeCost] Error type:', errorSelectors[selector]);
+                }
+            } else {
+                console.error('[estimateMerkleTreeCost] No revert data - likely a require() without message or out of gas');
+            }
+
+            throw error;
+        }
+    };
+
+    /**
+     * Executes a merkle tree payment for bulk uploads
+     * @param depth - Merkle tree depth
+     * @param poolCommitments - Array of pool commitments
+     * @param merklePaymentTimestamp - Timestamp for the payment
+     * @returns Payment result with winner pool hash and amount paid
+     */
+    const payForMerkleTree = async (
+        depth: number,
+        poolCommitments: PoolCommitment[],
+        merklePaymentTimestamp: bigint
+    ): Promise<MerklePaymentResult> => {
+        await ensureCorrectChain();
+
+        console.log('[payForMerkleTree] Starting merkle tree payment...');
+        console.log('[payForMerkleTree] Depth:', depth);
+        console.log('[payForMerkleTree] Pool commitments:', poolCommitments.length);
+        console.log('[payForMerkleTree] Timestamp:', merklePaymentTimestamp);
+
+        // First estimate the cost
+        const estimatedCost = await estimateMerkleTreeCost(depth, poolCommitments, merklePaymentTimestamp);
+        console.log('[payForMerkleTree] Estimated cost:', estimatedCost);
+
+        // Check and approve tokens for the merkle payment vault
+        const allowance = await getAllowance(wallet.value.address, merklePaymentVaultContractAddress);
+        console.log('[payForMerkleTree] Current allowance:', allowance);
+
+        if (allowance < estimatedCost) {
+            console.log('[payForMerkleTree] Approving tokens for merkle payment vault...');
+            await approveTokens(merklePaymentVaultContractAddress, estimatedCost);
+        }
+
+        // Execute the merkle tree payment transaction
+        console.log('[payForMerkleTree] Executing merkle tree payment...');
+        const txHash = await writeContract(wagmiAdapter.wagmiConfig, {
+            abi: merklePaymentVaultAbi,
+            address: merklePaymentVaultContractAddress,
+            functionName: "payForMerkleTree",
+            args: [depth, poolCommitments, merklePaymentTimestamp]
+        });
+
+        console.log('[payForMerkleTree] Transaction hash:', txHash);
+
+        // Wait for the transaction receipt
+        const receipt = await waitForTransactionReceipt(wagmiAdapter.wagmiConfig, { hash: txHash });
+        console.log('[payForMerkleTree] Transaction receipt:', receipt);
+        console.log('[payForMerkleTree] Receipt logs:', receipt.logs);
+
+        // Parse the MerklePaymentMade event from the transaction logs
+        // Event: MerklePaymentMade(bytes32 indexed winnerPoolHash, uint8 depth, uint256 totalAmount, uint64 merklePaymentTimestamp)
+        let actualWinnerPoolHash: string | null = null;
+        let actualTotalAmount: bigint | null = null;
+
+        for (const log of receipt.logs) {
+            try {
+                const decoded = decodeEventLog({
+                    abi: merklePaymentVaultAbi,
+                    data: log.data,
+                    topics: log.topics,
+                });
+
+                if (decoded.eventName === 'MerklePaymentMade') {
+                    // For indexed bytes32, it's in topics[1]
+                    actualWinnerPoolHash = log.topics[1] as string;
+                    actualTotalAmount = (decoded.args as any).totalAmount;
+                    console.log('[payForMerkleTree] Found MerklePaymentMade event!');
+                    console.log('[payForMerkleTree] Actual winnerPoolHash:', actualWinnerPoolHash);
+                    console.log('[payForMerkleTree] Actual totalAmount:', actualTotalAmount);
+                    break;
+                }
+            } catch (e) {
+                // Not our event, continue
+            }
+        }
+
+        if (!actualWinnerPoolHash || actualTotalAmount === null) {
+            console.error('[payForMerkleTree] Could not find MerklePaymentMade event in logs!');
+            throw new Error('Could not find MerklePaymentMade event in transaction logs');
+        }
+
+        // Refresh balances after payment
+        refreshBalances();
+
+        return {
+            winnerPoolHash: actualWinnerPoolHash,
+            amountPaid: actualTotalAmount.toString()
+        };
+    };
+
     // Return
     return {
         // State
@@ -1431,6 +1706,9 @@ export const useWalletStore = defineStore("wallet", () => {
         getSmartAccountInfo,
         estimatePaymasterCosts,
         fundSmartAccount,
+        // Merkle payments
+        estimateMerkleTreeCost,
+        payForMerkleTree,
     };
 });
 

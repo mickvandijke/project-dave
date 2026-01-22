@@ -5,6 +5,7 @@ pub mod constants;
 mod encryption;
 pub mod files;
 pub mod local_storage;
+pub mod merkle_payments;
 pub mod payments;
 mod quote;
 pub mod receipt_processing;

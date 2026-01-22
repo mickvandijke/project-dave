@@ -7,7 +7,7 @@ const settings = useSettings();
 const { showSuccess, showError } = useNotifications();
 
 // Destructure for template convenience
-const { downloadPath, usePaymaster, appVersion, isLoading, isSaving } = settings;
+const { downloadPath, usePaymaster, useMerklePayments, appVersion, isLoading, isSaving } = settings;
 
 // Load current settings
 const loadSettings = async () => {
@@ -51,6 +51,21 @@ const onPaymasterToggle = async () => {
     );
   } catch (error) {
     showError('Error', 'Failed to update paymaster settings');
+  }
+};
+
+// Auto-save merkle payments settings when toggled
+const onMerklePaymentsToggle = async () => {
+  try {
+    await settings.setUseMerklePayments(!useMerklePayments.value);
+    showSuccess(
+      'Success',
+      useMerklePayments.value
+        ? 'Merkle payments enabled - optimized for bulk uploads'
+        : 'Merkle payments disabled - standard payments active'
+    );
+  } catch (error) {
+    showError('Error', 'Failed to update merkle payments settings');
   }
 };
 
@@ -136,6 +151,33 @@ onMounted(async () => {
               Enable Paymaster (Gas-free transactions)
             </label>
           </div>
+        </div>
+
+        <!-- Merkle Payments Section -->
+        <div class="border-t border-white/10 pt-6">
+          <h2 class="text-xl font-semibold text-autonomi-header-text dark:text-autonomi-text-primary-dark mb-4">
+            Merkle Payments
+          </h2>
+          <p class="text-sm text-autonomi-text-primary mb-4">
+            Enable merkle payments for more gas-efficient bulk uploads. When uploading 64+ chunks, a single merkle tree
+            transaction is used instead of individual payments, reducing gas costs significantly.
+          </p>
+
+          <div class="flex items-center gap-3">
+            <Checkbox
+              :model-value="useMerklePayments"
+              inputId="useMerklePayments"
+              binary
+              @change="onMerklePaymentsToggle"
+              :disabled="isSaving || usePaymaster"
+            />
+            <label for="useMerklePayments" class="text-sm text-autonomi-text-primary cursor-pointer">
+              Enable Merkle Payments (Optimized bulk uploads)
+            </label>
+          </div>
+          <p v-if="usePaymaster" class="text-xs text-autonomi-text-secondary dark:text-autonomi-text-secondary-dark mt-2">
+            Merkle payments are not available when paymaster is enabled.
+          </p>
         </div>
 
         <!-- Logs Directory Section -->

@@ -1,9 +1,20 @@
-import { useWalletStore } from "./wallet";
+import { useWalletStore, type MerklePaymentOrder, type PoolCommitment, type MerklePaymentResult } from "./wallet";
 import { invoke } from "@tauri-apps/api/core";
 
 export type PaymentOrder = {
   id: number;
   payments: [string, string, string][];  // Array of tuples, not array containing single tuple
+};
+
+// Merkle payment order from backend
+export type BackendMerklePaymentOrder = {
+  upload_id: string;
+  depth: number;
+  pool_commitments: any[];  // Serialized pool commitments from backend
+  merkle_payment_timestamp: number;
+  estimated_cost: string;
+  total_files: number;
+  total_size: number;
 };
 
 export enum ProcessingState {
@@ -19,6 +30,18 @@ export type PendingPayment = {
   processing: ProcessingState;
 };
 
+export type PendingMerklePayment = {
+  uploadId: string;
+  depth: number;
+  poolCommitments: PoolCommitment[];
+  merklePaymentTimestamp: bigint;
+  estimatedCost: bigint;
+  totalFiles: number;
+  totalSize: bigint;
+  expires: number;
+  processing: ProcessingState;
+};
+
 export const usePaymentStore = defineStore("payments", () => {
   const walletStore = useWalletStore();
 
@@ -26,6 +49,7 @@ export const usePaymentStore = defineStore("payments", () => {
   const IDLE_PAYMENT_EXPIRATION_TIME_SECS = ref<number>(600);
   const currentPayment = ref<any>(null);
   const pendingPayments: Ref<Map<number, PendingPayment>> = ref(new Map());
+  const pendingMerklePayments: Ref<Map<string, PendingMerklePayment>> = ref(new Map());
   const showPayments = ref(false);
   const signPaymentPending = ref(false);
 
@@ -182,22 +206,241 @@ export const usePaymentStore = defineStore("payments", () => {
     });
   };
 
+  // Merkle Payment Methods
+
+  /**
+   * Converts backend merkle payment order to frontend format
+   */
+  // Helper to convert byte array to hex string
+  const bytesToHex = (bytes: number[]): `0x${string}` => {
+    return `0x${bytes.map(b => b.toString(16).padStart(2, '0')).join('')}` as `0x${string}`;
+  };
+
+  // Helper to safely convert to BigInt, handling null/undefined (for Option<u64> from Rust)
+  const safeBigInt = (value: number | string | null | undefined): bigint => {
+    if (value === null || value === undefined) {
+      return BigInt(0);
+    }
+    return BigInt(value);
+  };
+
+  /**
+   * CRITICAL: Data type conversion matching the autonomi Rust crate.
+   * The backend uses one enum scheme, but the smart contract expects a different mapping.
+   * This conversion is applied in evmlib/src/contract/mod.rs before contract calls.
+   *
+   * Backend -> Contract mapping:
+   *   0 (Chunk)      -> 2
+   *   1 (GraphEntry) -> 0
+   *   2 (Pointer)    -> 3
+   *   3 (Scratchpad) -> 1
+   *   other          -> 4 (Does not exist)
+   */
+  const dataTypeConversion = (dataType: number): number => {
+    switch (dataType) {
+      case 0: return 2; // Chunk
+      case 1: return 0; // GraphEntry
+      case 2: return 3; // Pointer
+      case 3: return 1; // Scratchpad
+      default: return 4; // Does not exist
+    }
+  };
+
+  const convertBackendMerkleOrder = (backendOrder: BackendMerklePaymentOrder): PendingMerklePayment => {
+    console.log("[convertBackendMerkleOrder] === CONVERSION DEBUG ===");
+    console.log("[convertBackendMerkleOrder] Backend order depth:", backendOrder.depth);
+    console.log("[convertBackendMerkleOrder] Backend pool_commitments count:", backendOrder.pool_commitments.length);
+    console.log("[convertBackendMerkleOrder] Expected pool count (2^ceil(depth/2)):", 1 << Math.ceil(backendOrder.depth / 2));
+
+    // Convert pool commitments from backend format
+    const poolCommitments: PoolCommitment[] = backendOrder.pool_commitments.map((pc: any, poolIndex: number) => {
+      console.log(`[convertBackendMerkleOrder] Pool ${poolIndex}:`);
+      console.log(`  - pool_hash bytes length: ${pc.pool_hash?.length}`);
+      console.log(`  - candidates count: ${pc.candidates?.length} (expected: 16)`);
+
+      // Validate pool_hash is exactly 32 bytes
+      if (pc.pool_hash?.length !== 32) {
+        console.error(`[convertBackendMerkleOrder] ERROR: pool_hash has ${pc.pool_hash?.length} bytes, expected 32`);
+      }
+
+      // Validate exactly 16 candidates
+      if (pc.candidates?.length !== 16) {
+        console.error(`[convertBackendMerkleOrder] ERROR: Pool ${poolIndex} has ${pc.candidates?.length} candidates, expected 16`);
+      }
+
+      const poolHash = bytesToHex(pc.pool_hash);
+      console.log(`  - poolHash (hex): ${poolHash}`);
+
+      return {
+        // pool_hash is a byte array, convert to hex string
+        poolHash,
+        candidates: pc.candidates.map((c: any, candIndex: number) => {
+          // Apply data type conversion to match the smart contract's expected format
+          const convertedDataType = dataTypeConversion(c.metrics.data_type);
+
+          // Log first candidate of each pool for debugging
+          if (candIndex === 0) {
+            console.log(`  - First candidate rewards_address: ${c.rewards_address}`);
+            console.log(`  - First candidate data_type: ${c.metrics.data_type} -> converted to: ${convertedDataType}`);
+            console.log(`  - First candidate close_records_stored: ${c.metrics.close_records_stored}`);
+            console.log(`  - First candidate records_per_type (raw):`, c.metrics.records_per_type);
+            console.log(`  - First candidate records_per_type (converted):`, (c.metrics.records_per_type || []).map((r: [number, number]) => [dataTypeConversion(r[0]), r[1]]));
+          }
+
+          // IMPORTANT: Only send the 3 fields the contract expects
+          // (matching autonomi crate's encoding - see evmlib/src/contract/merkle_payment_vault/interface.rs)
+          return {
+            rewardsAddress: c.rewards_address,
+            metrics: {
+              // CRITICAL: Apply dataTypeConversion to match Rust crate behavior
+              dataType: convertedDataType,
+              closeRecordsStored: safeBigInt(c.metrics.close_records_stored),
+              // records_per_type is array of tuples [data_type, records]
+              // CRITICAL: Also convert dataType in each record
+              recordsPerType: (c.metrics.records_per_type || []).map((r: [number, number]) => ({
+                dataType: dataTypeConversion(r[0]),
+                records: BigInt(r[1])
+              })),
+            }
+          };
+        })
+      };
+    });
+
+    console.log("[convertBackendMerkleOrder] Conversion complete");
+
+    return {
+      uploadId: backendOrder.upload_id,
+      depth: backendOrder.depth,
+      poolCommitments,
+      merklePaymentTimestamp: BigInt(backendOrder.merkle_payment_timestamp),
+      estimatedCost: BigInt(backendOrder.estimated_cost),
+      totalFiles: backendOrder.total_files,
+      totalSize: BigInt(backendOrder.total_size),
+      expires: Date.now() + 1000 * IDLE_PAYMENT_EXPIRATION_TIME_SECS.value,
+      processing: ProcessingState.PENDING
+    };
+  };
+
+  /**
+   * Adds a pending merkle payment from a backend event
+   */
+  const addPendingMerklePayment = (backendOrder: BackendMerklePaymentOrder) => {
+    console.log(">>> ADDING MERKLE PAYMENT", backendOrder);
+
+    const pendingMerklePayment = convertBackendMerkleOrder(backendOrder);
+    pendingMerklePayments.value.set(backendOrder.upload_id, pendingMerklePayment);
+
+    console.log(">>> Merkle payment added:", pendingMerklePayment);
+  };
+
+  /**
+   * Sets the processing state for a merkle payment
+   */
+  const setMerkleProcessingState = (uploadId: string, state: ProcessingState) => {
+    const payment = pendingMerklePayments.value.get(uploadId);
+
+    if (payment) {
+      payment.processing = state;
+      pendingMerklePayments.value.set(uploadId, payment);
+    } else {
+      console.error(`Merkle payment with upload ID ${uploadId} not found.`);
+    }
+  };
+
+  /**
+   * Gets the processing state for a merkle payment
+   */
+  const getMerkleProcessingState = (uploadId: string): ProcessingState | undefined => {
+    const payment = pendingMerklePayments.value.get(uploadId);
+    return payment ? payment.processing : undefined;
+  };
+
+  /**
+   * Pays for a merkle tree payment
+   */
+  const payMerkle = async (uploadId: string): Promise<MerklePaymentResult | null> => {
+    const payment = pendingMerklePayments.value.get(uploadId);
+
+    if (!payment) {
+      console.error(`Merkle payment with upload ID ${uploadId} not found.`);
+      return null;
+    }
+
+    const processingState = getMerkleProcessingState(uploadId);
+    if (
+      processingState === ProcessingState.PROCESSING ||
+      processingState === ProcessingState.COMPLETED
+    ) {
+      console.log("Merkle payment already processing or completed");
+      return null;
+    }
+
+    try {
+      console.log(">>> Attempting to pay for merkle payment", payment);
+      signPaymentPending.value = true;
+
+      setMerkleProcessingState(uploadId, ProcessingState.PROCESSING);
+
+      // Execute the merkle tree payment
+      const result = await walletStore.payForMerkleTree(
+        payment.depth,
+        payment.poolCommitments,
+        payment.merklePaymentTimestamp
+      );
+
+      setMerkleProcessingState(uploadId, ProcessingState.COMPLETED);
+
+      // Confirm the upload with the backend
+      await invoke("confirm_merkle_upload_payment", {
+        uploadId,
+        merkleResult: {
+          winner_pool_hash: result.winnerPoolHash,
+          amount_paid: result.amountPaid
+        }
+      });
+
+      signPaymentPending.value = false;
+      console.log(">>> Merkle payment complete", result);
+
+      return result;
+    } catch (err) {
+      console.error(">>> Error paying for merkle payment", err);
+      signPaymentPending.value = false;
+      setMerkleProcessingState(uploadId, ProcessingState.CANCELLED);
+      throw err;
+    }
+  };
+
+  /**
+   * Cancels a merkle payment
+   */
+  const cancelMerkle = (uploadId: string) => {
+    setMerkleProcessingState(uploadId, ProcessingState.CANCELLED);
+    pendingMerklePayments.value.delete(uploadId);
+  };
+
   // Return values
   return {
     currentPayment,
     IDLE_PAYMENT_EXPIRATION_TIME_SECS,
     pendingPayments,
+    pendingMerklePayments,
     pendingPaymentsCount,
     signPaymentPending,
     sortedPendingPayments,
     addPendingPayment,
+    addPendingMerklePayment,
     calculateRemainingTime,
     calculateTotalAmount,
     getProcessingState,
+    getMerkleProcessingState,
     resetExpirationTime,
     setCurrentPayment,
     setPaymentView,
     pay,
+    payMerkle,
     cancel,
+    cancelMerkle,
   };
 });
